@@ -13,14 +13,14 @@ api_secret = "oER1r73vKVvdWf5cJ0Hn7aOq4R1Pe3HAlciVgyur0TMZ9j0tqP5wUk1YwDLPazRD"
 client = Client(api_key, api_secret, testnet=True)
 
 
-class RealTimePaperTrading:
+class SpotPaperTrading:
     def __init__(self, api_key, api_secret, symbol="BTCUSDT", initial_cash=10000, threshold=0.004,
                  momentum_window=20, meanrev_window=50):
         self.client = Client(api_key, api_secret, testnet=True)
         self.symbol = symbol
         self.initial_cash = initial_cash
         self.cash = initial_cash
-        self.position = 0
+        self.position = 0   # 0 = no position, 1 = long
         self.entry_price = None
         self.trades = 0
         self.realized_pnl = 0.0
@@ -29,22 +29,19 @@ class RealTimePaperTrading:
         self.threshold = threshold
         self.momentum_window = momentum_window
         self.meanrev_window = meanrev_window
-        self.trade_log = []  # store trade history
+        self.trade_log = []
 
-        # Prepare CSV for trade logs
-        with open("trade_log.csv", "w", newline="") as f:
+        with open("trade_log_spot.csv", "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Time", "Action", "Price", "P&L", "Net_P&L", "Equity"])
 
     def log_trade(self, action, price, trade_pnl, net_pnl, equity):
-        """Log each trade to CSV."""
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        with open("trade_log.csv", "a", newline="") as f:
+        with open("trade_log_spot.csv", "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([now, action, price, trade_pnl, net_pnl, equity])
 
     def process_new_price(self, price):
-        """Handle new tick/price every 5 seconds."""
         self.prices.append(price)
         if len(self.prices) < self.meanrev_window:
             return
@@ -67,40 +64,48 @@ class RealTimePaperTrading:
             meanrev_signal = -1
 
         combined_signal = momentum_signal + meanrev_signal
-        desired_position = 1 if combined_signal > 0 else -1 if combined_signal < 0 else 0
+
+        # --- SPOT TRADING LOGIC (only long, no short) ---
+        if combined_signal > 0:
+            desired_position = 1  # go long
+        elif combined_signal < 0:
+            desired_position = 0  # exit position (neutral)
+        else:
+            desired_position = self.position  # hold current position
 
         # --- Trade Execution ---
         if desired_position != self.position:
-            if self.position != 0:  # closing previous trade
-                trade_pnl = (price - self.entry_price) * self.position
+            # closing trade
+            if self.position == 1 and desired_position == 0:
+                trade_pnl = (price - self.entry_price)
                 self.realized_pnl += trade_pnl
-                print(f"💰 Trade Closed | P&L={trade_pnl:.2f} | Net P&L={self.realized_pnl:.2f}")
-                self.log_trade("CLOSE", price, trade_pnl, self.realized_pnl, self.equity_curve[-1])
+                print(f"💰 SELL (Exit Long) | P&L={trade_pnl:.2f} | Net P&L={self.realized_pnl:.2f}")
+                self.log_trade("SELL", price, trade_pnl, self.realized_pnl, self.equity_curve[-1])
 
-            if desired_position != 0:  # opening new trade
+            # opening trade
+            elif self.position == 0 and desired_position == 1:
                 self.entry_price = price
-                print(f"📈 New Trade Opened | Position={desired_position} @ {price:.2f}")
-                self.log_trade("OPEN", price, 0, self.realized_pnl, self.equity_curve[-1])
+                print(f"📈 BUY (Open Long) @ {price:.2f}")
+                self.log_trade("BUY", price, 0, self.realized_pnl, self.equity_curve[-1])
 
             self.trades += 1
             self.position = desired_position
 
-        # Update equity
-        if self.position != 0 and self.entry_price is not None:
-            unrealized_pnl = (price - self.entry_price) * self.position
+        # update equity
+        if self.position == 1 and self.entry_price is not None:
+            unrealized_pnl = (price - self.entry_price)
         else:
             unrealized_pnl = 0
 
         equity = self.initial_cash + self.realized_pnl + unrealized_pnl
         self.equity_curve.append(equity)
 
-        print(f"[Price={price:.2f}] Position={self.position} | Unrealized P&L={unrealized_pnl:.2f} | "
-              f"Net P&L={self.realized_pnl:.2f} | Equity={equity:.2f} | Trades={self.trades}")
+        print(f"[Price={price:.2f}] Pos={self.position} | Unr.PnL={unrealized_pnl:.2f} | "
+              f"NetPnL={self.realized_pnl:.2f} | Equity={equity:.2f} | Trades={self.trades}")
 
     def performance_report(self):
-        """Generate performance stats from logs."""
-        df = pd.read_csv("trade_log.csv")
-        closes = df[df["Action"] == "CLOSE"]
+        df = pd.read_csv("trade_log_spot.csv")
+        closes = df[df["Action"].isin(["SELL"])]
         total_trades = len(closes)
         wins = len(closes[closes["P&L"] > 0])
         losses = len(closes[closes["P&L"] <= 0])
@@ -109,7 +114,6 @@ class RealTimePaperTrading:
         final_equity = df["Equity"].iloc[-1] if len(df) else self.initial_cash
         profit_pct = (final_equity - self.initial_cash) / self.initial_cash * 100
 
-        # Max drawdown
         if len(df) > 1:
             equity = df["Equity"]
             rolling_max = equity.cummax()
@@ -126,8 +130,7 @@ class RealTimePaperTrading:
         print(f"Max Drawdown: {max_dd:.2f}%")
         print("--------------------------------\n")
 
-    def run(self, duration=86400):
-        """Fetch live prices every 5 seconds for `duration` seconds."""
+    def run(self, duration=3600):
         end_time = time.time() + duration
         while time.time() < end_time:
             try:
@@ -142,16 +145,16 @@ class RealTimePaperTrading:
 
 
 # -----------------------------
-# Run for 24 hours
+# Run Bot
 # -----------------------------
-bot = RealTimePaperTrading(
+bot = SpotPaperTrading(
     api_key,
     api_secret,
     symbol="BTCUSDT",
     initial_cash=10000,
-    threshold=0.003,
-    momentum_window=10,
-    meanrev_window=30
+    threshold=0.005,
+    momentum_window=120,
+    meanrev_window=360
 )
 
-bot.run(duration=86400)  # 24 hours
+bot.run(duration=86400)
