@@ -15,7 +15,7 @@ client = Client(api_key, api_secret, testnet=True)
 
 class SpotPaperTrading:
     def __init__(self, api_key, api_secret, symbol="BTCUSDT", initial_cash=10000, threshold=0.004,
-                 momentum_window=20, meanrev_window=50):
+                 momentum_window=20, meanrev_window=50, taker_fee=0.001):
         self.client = Client(api_key, api_secret, testnet=True)
         self.symbol = symbol
         self.initial_cash = initial_cash
@@ -30,6 +30,7 @@ class SpotPaperTrading:
         self.momentum_window = momentum_window
         self.meanrev_window = meanrev_window
         self.trade_log = []
+        self.taker_fee = taker_fee  # 🔹 Added taker fee (e.g., 0.1%)
 
         with open("trade_log_spot.csv", "w", newline="") as f:
             writer = csv.writer(f)
@@ -77,15 +78,18 @@ class SpotPaperTrading:
         if desired_position != self.position:
             # closing trade
             if self.position == 1 and desired_position == 0:
-                trade_pnl = (price - self.entry_price)
+                # 🔹 Include taker fee on both buy and sell sides
+                gross_pnl = (price - self.entry_price)
+                total_fee = (self.entry_price + price) * self.taker_fee  # buy+sell fees
+                trade_pnl = gross_pnl - total_fee  # net profit after fees
                 self.realized_pnl += trade_pnl
-                print(f"💰 SELL (Exit Long) | P&L={trade_pnl:.2f} | Net P&L={self.realized_pnl:.2f}")
+                print(f"💰 SELL (Exit Long) | GrossPnL={gross_pnl:.2f} | Fee={total_fee:.2f} | NetPnL={trade_pnl:.2f} | TotalPnL={self.realized_pnl:.2f}")
                 self.log_trade("SELL", price, trade_pnl, self.realized_pnl, self.equity_curve[-1])
 
             # opening trade
             elif self.position == 0 and desired_position == 1:
                 self.entry_price = price
-                print(f"📈 BUY (Open Long) @ {price:.2f}")
+                print(f"📈 BUY (Open Long) @ {price:.2f} (Fee deducted on exit)")
                 self.log_trade("BUY", price, 0, self.realized_pnl, self.equity_curve[-1])
 
             self.trades += 1
@@ -93,7 +97,7 @@ class SpotPaperTrading:
 
         # update equity
         if self.position == 1 and self.entry_price is not None:
-            unrealized_pnl = (price - self.entry_price)
+            unrealized_pnl = (price - self.entry_price) - (price * self.taker_fee)  # include potential exit fee
         else:
             unrealized_pnl = 0
 
@@ -128,6 +132,7 @@ class SpotPaperTrading:
         print(f"Total P&L: {total_pnl:.2f}")
         print(f"Profit %: {profit_pct:.2f}%")
         print(f"Max Drawdown: {max_dd:.2f}%")
+        print(f"Taker Fee: {self.taker_fee * 100:.2f}% per trade")
         print("--------------------------------\n")
 
     def run(self, duration=3600):
@@ -154,7 +159,8 @@ bot = SpotPaperTrading(
     initial_cash=10000,
     threshold=0.005,
     momentum_window=120,
-    meanrev_window=360
+    meanrev_window=360,
+    taker_fee=0.001  # 🔹 0.1% taker fee
 )
 
 bot.run(duration=86400)
