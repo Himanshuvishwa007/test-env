@@ -169,7 +169,7 @@ bot = BollingerSpotBot(
     bb_std_dev=3,
     sma_filter_window=30,
     taker_fee=0.001,
-    tp_pct=0.02,   # 2% take profit
+    tp_pct=0.04,   # 2% take profit
     sl_pct=0.01    # 1% stop loss
 )
 
