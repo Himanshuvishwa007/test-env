@@ -5,6 +5,7 @@ import time
 import csv
 from datetime import datetime
 
+
 # -----------------------------
 # Connect to Binance Testnet
 # -----------------------------
@@ -15,7 +16,9 @@ client = Client(api_key, api_secret, testnet=True)
 
 class BollingerSpotBot:
     def __init__(self, api_key, api_secret, symbol="BTCUSDT", initial_cash=10000,
-                 bb_window=50, bb_std_dev=3, sma_filter_window=30, taker_fee=0.001):
+                 bb_window=50, bb_std_dev=3, sma_filter_window=30,
+                 taker_fee=0.001, tp_pct=0.02, sl_pct=0.01):
+
         self.client = Client(api_key, api_secret, testnet=True)
         self.symbol = symbol
         self.initial_cash = initial_cash
@@ -30,14 +33,16 @@ class BollingerSpotBot:
         self.bb_std_dev = bb_std_dev
         self.sma_filter_window = sma_filter_window
         self.taker_fee = taker_fee
+        self.tp_pct = tp_pct
+        self.sl_pct = sl_pct
 
-        # Create trade log
         with open("trade_log_bollinger.csv", "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Time", "Action", "Price", "TradePnL", "NetPnL", "Equity"])
 
         print(f"✅ Bot initialized: {symbol} | Interval=1m")
-        print(f"⚙️  Params → BB Window={bb_window}, BB Std={bb_std_dev}, SMA Filter={sma_filter_window}, Fee={taker_fee*100:.2f}%")
+        print(f"⚙️ Params → BB Window={bb_window}, BB Std={bb_std_dev}, SMA Filter={sma_filter_window}, "
+              f"Fee={taker_fee*100:.2f}%, TP={tp_pct*100:.1f}%, SL={sl_pct*100:.1f}%")
 
     def log_trade(self, action, price, trade_pnl, net_pnl, equity):
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -71,15 +76,32 @@ class BollingerSpotBot:
             print(f"📈 BUY @ {price:.2f}")
             self.log_trade("BUY", price, 0, self.realized_pnl, self.equity_curve[-1])
 
-        elif sell_signal and self.position == 1:
-            gross_pnl = (price - self.entry_price)
-            total_fee = (self.entry_price + price) * self.taker_fee
-            trade_pnl = gross_pnl - total_fee
-            self.realized_pnl += trade_pnl
-            self.position = 0
-            self.trades += 1
-            print(f"💰 SELL @ {price:.2f} | TradePnL={trade_pnl:.2f} | NetPnL={self.realized_pnl:.2f}")
-            self.log_trade("SELL", price, trade_pnl, self.realized_pnl, self.equity_curve[-1])
+        # --- Take Profit / Stop Loss logic ---
+        elif self.position == 1:
+            tp_price = self.entry_price * (1 + self.tp_pct)
+            sl_price = self.entry_price * (1 - self.sl_pct)
+
+            if price >= tp_price:
+                reason = "TAKE_PROFIT"
+                exit_price = tp_price
+            elif price <= sl_price:
+                reason = "STOP_LOSS"
+                exit_price = sl_price
+            elif sell_signal:
+                reason = "SELL_SIGNAL"
+                exit_price = price
+            else:
+                reason = None
+
+            if reason:
+                gross_pnl = (exit_price - self.entry_price)
+                total_fee = (self.entry_price + exit_price) * self.taker_fee
+                trade_pnl = gross_pnl - total_fee
+                self.realized_pnl += trade_pnl
+                self.position = 0
+                self.trades += 1
+                print(f"💰 SELL ({reason}) @ {exit_price:.2f} | TradePnL={trade_pnl:.2f} | NetPnL={self.realized_pnl:.2f}")
+                self.log_trade(reason, exit_price, trade_pnl, self.realized_pnl, self.equity_curve[-1])
 
         # --- Update Equity ---
         if self.position == 1:
@@ -95,7 +117,7 @@ class BollingerSpotBot:
 
     def performance_report(self):
         df = pd.read_csv("trade_log_bollinger.csv")
-        closes = df[df["Action"].isin(["SELL"])]
+        closes = df[df["Action"].isin(["SELL", "TAKE_PROFIT", "STOP_LOSS"])]
         total_trades = len(closes)
         wins = len(closes[closes["TradePnL"] > 0])
         losses = len(closes[closes["TradePnL"] <= 0])
@@ -128,7 +150,7 @@ class BollingerSpotBot:
             try:
                 price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
                 self.process_new_price(price)
-                time.sleep(60)  # 1-minute delay for each update
+                time.sleep(60)
             except Exception as e:
                 print(f"⚠️ Error: {e}")
                 time.sleep(10)
@@ -143,10 +165,12 @@ bot = BollingerSpotBot(
     api_secret,
     symbol="BTCUSDT",
     initial_cash=10000,
-    bb_window=50,
+    bb_window=20,
     bb_std_dev=3,
     sma_filter_window=30,
-    taker_fee=0.001
+    taker_fee=0.001,
+    tp_pct=0.02,   # 2% take profit
+    sl_pct=0.01    # 1% stop loss
 )
 
 bot.run(duration=86400)  # Run for 24 hours
