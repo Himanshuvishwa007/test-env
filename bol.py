@@ -5,172 +5,169 @@ import time
 import csv
 from datetime import datetime
 
+# -----------------------------
+# 🔑 ENTER YOUR REAL API KEYS
+# -----------------------------
+api_key = "cL4LHJfRXt9FO2p3f65GGvqBmypnlH2jihupQU8uHJEv1BSrC48P6YWSQJdUVgV6"
+api_secret = "lkhKrYkoMIldhtabkdU1KyiUi2WyCj7gD8GMYDILZ0vZg7iIZWEGuEE63JqjtpQG"
 
 # -----------------------------
-# Connect to Binance Testnet
+# ⚙️ TRADING CONFIG
 # -----------------------------
-api_key = "YMkkDGSM5Euk3NsAt21WcRhFFvm70559lMh1hsD79tQ0ayqPnctslCpFuEMA5R2yD"
-api_secret = "oER1r73vKVvdWf5cJ0Hn7aOq4R1Pe3HAlciVgyur0TMZ9j0tqP5wUk1YwDLPazRD"
-client = Client(api_key, api_secret, testnet=True)
+SYMBOL = "BTCFDUSD"
+INTERVAL_SECS = 60           # check price every 1 min
+BB_WINDOW = 41
+BB_STD_DEV = 3
+SMA_FILTER_WINDOW = 49
+TP_PCT = 0.07                # 7% take profit
+SL_PCT = 0.03                # 3% stop loss
+CASH_RESERVE_PCT = 0.001     # keep 0.1% FDUSD for safety
+BASE_RESERVE_PCT = 0.001     # keep 0.1% BTC when selling
 
-
-class BollingerSpotBot:
-    def __init__(self, api_key, api_secret, symbol="BTCUSDT", initial_cash=10000,
-                 bb_window=50, bb_std_dev=3, sma_filter_window=30,
-                 taker_fee=0.001, tp_pct=0.02, sl_pct=0.01):
-
-        self.client = Client(api_key, api_secret, testnet=True)
+# -----------------------------
+# 🧠 BOT CLASS
+# -----------------------------
+class BollingerSpotLive:
+    def __init__(self, api_key, api_secret, symbol):
+        self.client = Client(api_key, api_secret)
         self.symbol = symbol
-        self.initial_cash = initial_cash
-        self.cash = initial_cash
         self.position = 0
         self.entry_price = None
-        self.trades = 0
         self.realized_pnl = 0.0
-        self.equity_curve = [initial_cash]
+        self.trades = 0
         self.prices = []
-        self.bb_window = bb_window
-        self.bb_std_dev = bb_std_dev
-        self.sma_filter_window = sma_filter_window
-        self.taker_fee = taker_fee
-        self.tp_pct = tp_pct
-        self.sl_pct = sl_pct
+        self.equity_curve = []
 
-        with open("trade_log_bollinger.csv", "w", newline="") as f:
+        # Log file
+        with open("trade_log_live.csv", "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["Time", "Action", "Price", "TradePnL", "NetPnL", "Equity"])
+            writer.writerow(["Time", "Action", "Price", "TradePnL", "NetPnL"])
 
-        print(f"✅ Bot initialized: {symbol} | Interval=1m")
-        print(f"⚙️ Params → BB Window={bb_window}, BB Std={bb_std_dev}, SMA Filter={sma_filter_window}, "
-              f"Fee={taker_fee*100:.2f}%, TP={tp_pct*100:.1f}%, SL={sl_pct*100:.1f}%")
+        print(f"✅ Live Bot initialized for {symbol}")
+        print(f"⚙️ Params: BB Window={BB_WINDOW}, BB Std={BB_STD_DEV}, SMA Filter={SMA_FILTER_WINDOW}, "
+              f"TP={TP_PCT*100:.1f}%, SL={SL_PCT*100:.1f}%")
 
-    def log_trade(self, action, price, trade_pnl, net_pnl, equity):
+    def log_trade(self, action, price, trade_pnl=0, net_pnl=0):
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        with open("trade_log_bollinger.csv", "a", newline="") as f:
+        with open("trade_log_live.csv", "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([now, action, price, trade_pnl, net_pnl, equity])
+            writer.writerow([now, action, price, trade_pnl, net_pnl])
+
+    def fetch_price(self):
+        price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+        return price
+
+    def get_balances(self):
+        balances = self.client.get_account()["balances"]
+        df = pd.DataFrame(balances)
+        df.set_index("asset", inplace=True)
+        fdusd = float(df.loc["FDUSD", "free"]) if "FDUSD" in df.index else 0
+        btc = float(df.loc["BTC", "free"]) if "BTC" in df.index else 0
+        return fdusd, btc
+
+    def buy_all(self, price):
+        fdusd, _ = self.get_balances()
+        spend_amt = fdusd * (1 - CASH_RESERVE_PCT)
+        if spend_amt < 5:
+            print(f"⚠️ Not enough FDUSD to buy ({spend_amt:.2f}).")
+            return
+
+        order = self.client.order_market_buy(symbol=self.symbol, quoteOrderQty=round(spend_amt, 2))
+        qty = sum(float(o["qty"]) for o in order["fills"])
+        self.entry_price = price
+        self.position = 1
+        self.trades += 1
+        print(f"📈 BUY @ {price:.2f} | Qty={qty:.6f} | Spent={spend_amt:.2f}")
+        self.log_trade("BUY", price)
+
+    def sell_all(self, price, reason):
+        _, btc = self.get_balances()
+        qty = btc * (1 - BASE_RESERVE_PCT)
+        if qty <= 0:
+            print("⚠️ No BTC available to sell.")
+            return
+
+        order = self.client.order_market_sell(symbol=self.symbol, quantity=round(qty, 6))
+        self.position = 0
+        self.trades += 1
+        trade_pnl = (price - self.entry_price) * qty
+        self.realized_pnl += trade_pnl
+        print(f"💰 SELL ({reason}) @ {price:.2f} | Qty={qty:.6f} | TradePnL={trade_pnl:.2f} | NetPnL={self.realized_pnl:.2f}")
+        self.log_trade(reason, price, trade_pnl, self.realized_pnl)
 
     def process_new_price(self, price):
         self.prices.append(price)
-        if len(self.prices) < max(self.bb_window, self.sma_filter_window):
+        if len(self.prices) < max(BB_WINDOW, SMA_FILTER_WINDOW):
             return
 
         df = pd.DataFrame({"Close": self.prices})
-        df["SMA"] = df["Close"].rolling(self.bb_window).mean()
-        df["STD"] = df["Close"].rolling(self.bb_window).std()
-        df["Upper"] = df["SMA"] + (self.bb_std_dev * df["STD"])
-        df["Lower"] = df["SMA"] - (self.bb_std_dev * df["STD"])
-        df["LongSMA"] = df["Close"].rolling(self.sma_filter_window).mean()
+        df["SMA"] = df["Close"].rolling(BB_WINDOW).mean()
+        df["STD"] = df["Close"].rolling(BB_WINDOW).std()
+        df["Upper"] = df["SMA"] + (BB_STD_DEV * df["STD"])
+        df["Lower"] = df["SMA"] - (BB_STD_DEV * df["STD"])
+        df["LongSMA"] = df["Close"].rolling(SMA_FILTER_WINDOW).mean()
         df.dropna(inplace=True)
         last = df.iloc[-1]
 
-        # --- Bollinger Band + SMA logic ---
         buy_signal = last["Close"] < last["Lower"] and last["Close"] > last["LongSMA"] * 0.8
         sell_signal = last["Close"] > last["SMA"]
 
-        # --- Execute Trades ---
+        # --- BUY LOGIC ---
         if buy_signal and self.position == 0:
-            self.entry_price = price
-            self.position = 1
-            self.trades += 1
-            print(f"📈 BUY @ {price:.2f}")
-            self.log_trade("BUY", price, 0, self.realized_pnl, self.equity_curve[-1])
+            self.buy_all(price)
 
-        # --- Take Profit / Stop Loss logic ---
+        # --- SELL LOGIC ---
         elif self.position == 1:
-            tp_price = self.entry_price * (1 + self.tp_pct)
-            sl_price = self.entry_price * (1 - self.sl_pct)
+            tp_price = self.entry_price * (1 + TP_PCT)
+            sl_price = self.entry_price * (1 - SL_PCT)
+            reason = None
 
             if price >= tp_price:
                 reason = "TAKE_PROFIT"
-                exit_price = tp_price
             elif price <= sl_price:
                 reason = "STOP_LOSS"
-                exit_price = sl_price
             elif sell_signal:
                 reason = "SELL_SIGNAL"
-                exit_price = price
-            else:
-                reason = None
 
             if reason:
-                gross_pnl = (exit_price - self.entry_price)
-                total_fee = (self.entry_price + exit_price) * self.taker_fee
-                trade_pnl = gross_pnl - total_fee
-                self.realized_pnl += trade_pnl
-                self.position = 0
-                self.trades += 1
-                print(f"💰 SELL ({reason}) @ {exit_price:.2f} | TradePnL={trade_pnl:.2f} | NetPnL={self.realized_pnl:.2f}")
-                self.log_trade(reason, exit_price, trade_pnl, self.realized_pnl, self.equity_curve[-1])
+                self.sell_all(price, reason)
 
-        # --- Update Equity ---
-        if self.position == 1:
-            unrealized_pnl = (price - self.entry_price) - (price * self.taker_fee)
-        else:
-            unrealized_pnl = 0
-
-        equity = self.initial_cash + self.realized_pnl + unrealized_pnl
-        self.equity_curve.append(equity)
-
-        print(f"[Price={price:.2f}] Pos={self.position} | Unr.PnL={unrealized_pnl:.2f} | "
-              f"NetPnL={self.realized_pnl:.2f} | Equity={equity:.2f} | Trades={self.trades}")
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Price={price:.2f} | Pos={self.position} | "
+              f"NetPnL={self.realized_pnl:.2f} | Trades={self.trades}")
 
     def performance_report(self):
-        df = pd.read_csv("trade_log_bollinger.csv")
-        closes = df[df["Action"].isin(["SELL", "TAKE_PROFIT", "STOP_LOSS"])]
+        df = pd.read_csv("trade_log_live.csv")
+        closes = df[df["Action"].str.contains("SELL")]
         total_trades = len(closes)
         wins = len(closes[closes["TradePnL"] > 0])
-        losses = len(closes[closes["TradePnL"] <= 0])
         win_rate = (wins / total_trades * 100) if total_trades else 0
         total_pnl = df["NetPnL"].iloc[-1] if len(df) else 0
-        final_equity = df["Equity"].iloc[-1] if len(df) else self.initial_cash
-        profit_pct = (final_equity - self.initial_cash) / self.initial_cash * 100
-
-        if len(df) > 1:
-            equity = df["Equity"]
-            rolling_max = equity.cummax()
-            drawdown = (equity - rolling_max) / rolling_max
-            max_dd = drawdown.min() * 100
-        else:
-            max_dd = 0
-
         print("\n📊 ---- PERFORMANCE SUMMARY ----")
         print(f"Total Trades: {total_trades}")
         print(f"Win Rate: {win_rate:.2f}%")
         print(f"Total P&L: {total_pnl:.2f}")
-        print(f"Profit %: {profit_pct:.2f}%")
-        print(f"Max Drawdown: {max_dd:.2f}%")
-        print(f"Taker Fee: {self.taker_fee * 100:.2f}% per trade")
-        print("--------------------------------\n")
+        print(f"Symbol: {self.symbol}")
+        print("-------------------------------\n")
 
-    def run(self, duration=86400):
-        end_time = time.time() + duration
-        print(f"\n🚀 Starting BollingerSpotBot for {self.symbol} | Interval=1m | Runtime={duration/3600:.1f}h\n")
-        while time.time() < end_time:
-            try:
-                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+    def run(self):
+        print(f"\n🚀 Running LIVE BOT for {self.symbol} (Maker Fee = 0%)")
+        print("Press Ctrl + C to stop anytime.\n")
+        try:
+            while True:
+                price = self.fetch_price()
                 self.process_new_price(price)
-                time.sleep(60)
-            except Exception as e:
-                print(f"⚠️ Error: {e}")
-                time.sleep(10)
-        self.performance_report()
-
+                time.sleep(INTERVAL_SECS)
+        except KeyboardInterrupt:
+            print("\n🛑 Bot stopped manually.")
+            self.performance_report()
+        except Exception as e:
+            print(f"⚠️ Error: {e}")
+            time.sleep(5)
+            self.run()
 
 # -----------------------------
-# Run the Bot
+# 🚀 RUN THE BOT
 # -----------------------------
-bot = BollingerSpotBot(
-    api_key,
-    api_secret,
-    symbol="BTCUSDT",
-    initial_cash=10000,
-    bb_window=20,
-    bb_std_dev=3,
-    sma_filter_window=30,
-    taker_fee=0.001,
-    tp_pct=0.04,   # 2% take profit
-    sl_pct=0.01    # 1% stop loss
-)
-
-bot.run(duration=86400)  # Run for 24 hours
+if __name__ == "__main__":
+    bot = BollingerSpotLive(API_KEY, API_SECRET, SYMBOL)
+    bot.run()
