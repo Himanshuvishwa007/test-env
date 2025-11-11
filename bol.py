@@ -169,5 +169,5 @@ class BollingerSpotLive:
 # 🚀 RUN THE BOT
 # -----------------------------
 if __name__ == "__main__":
-    bot = BollingerSpotLive(API_KEY, API_SECRET, SYMBOL)
+    bot = BollingerSpotLive(api_key, api_secret, SYMBOL)
     bot.run()
