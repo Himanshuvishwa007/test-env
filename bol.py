@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 # -----------------------------
 # 🔑 API KEYS (replace with yours)
 # -----------------------------
-api_key = "REPLACE_WITH_YOUR_KEY"
-api_secret = "REPLACE_WITH_YOUR_SECRET"
+api_key = "cL4LHJfRXt9FO2p3f65GGvqBmypnlH2jihupQU8uHJEv1BSrC48P6YWSQJdUVgV6"
+api_secret = "lkhKrYkoMIldhtabkdU1KyiUi2WyCj7gD8GMYDILZ0vZg7iIZWEGuEE63JqjtpQG"
 
 # -----------------------------
 # ⚙️ TRADING CONFIG
