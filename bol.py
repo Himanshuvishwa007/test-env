@@ -38,7 +38,7 @@ class BollingerSpotLive:
         self.prices = []
         self.equity_curve = []
 
-        # Log file
+        # Log file initialization
         with open("trade_log_live.csv", "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Time", "Action", "Price", "TradePnL", "NetPnL"])
@@ -54,8 +54,13 @@ class BollingerSpotLive:
             writer.writerow([now, action, price, trade_pnl, net_pnl])
 
     def fetch_price(self):
-        price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
-        return price
+        try:
+            price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            return price
+        except Exception as e:
+            print(f"⚠️ Price fetch error: {e}")
+            time.sleep(5)
+            return None
 
     def get_balances(self):
         balances = self.client.get_account()["balances"]
@@ -72,13 +77,16 @@ class BollingerSpotLive:
             print(f"⚠️ Not enough FDUSD to buy ({spend_amt:.2f}).")
             return
 
-        order = self.client.order_market_buy(symbol=self.symbol, quoteOrderQty=round(spend_amt, 2))
-        qty = sum(float(o["qty"]) for o in order["fills"])
-        self.entry_price = price
-        self.position = 1
-        self.trades += 1
-        print(f"📈 BUY @ {price:.2f} | Qty={qty:.6f} | Spent={spend_amt:.2f}")
-        self.log_trade("BUY", price)
+        try:
+            order = self.client.order_market_buy(symbol=self.symbol, quoteOrderQty=round(spend_amt, 2))
+            qty = sum(float(o["qty"]) for o in order["fills"])
+            self.entry_price = price
+            self.position = 1
+            self.trades += 1
+            print(f"📈 BUY @ {price:.2f} | Qty={qty:.6f} | Spent={spend_amt:.2f}")
+            self.log_trade("BUY", price)
+        except Exception as e:
+            print(f"⚠️ Buy order failed: {e}")
 
     def sell_all(self, price, reason):
         _, btc = self.get_balances()
@@ -87,15 +95,21 @@ class BollingerSpotLive:
             print("⚠️ No BTC available to sell.")
             return
 
-        order = self.client.order_market_sell(symbol=self.symbol, quantity=round(qty, 6))
-        self.position = 0
-        self.trades += 1
-        trade_pnl = (price - self.entry_price) * qty
-        self.realized_pnl += trade_pnl
-        print(f"💰 SELL ({reason}) @ {price:.2f} | Qty={qty:.6f} | TradePnL={trade_pnl:.2f} | NetPnL={self.realized_pnl:.2f}")
-        self.log_trade(reason, price, trade_pnl, self.realized_pnl)
+        try:
+            order = self.client.order_market_sell(symbol=self.symbol, quantity=round(qty, 6))
+            self.position = 0
+            self.trades += 1
+            trade_pnl = (price - self.entry_price) * qty
+            self.realized_pnl += trade_pnl
+            print(f"💰 SELL ({reason}) @ {price:.2f} | Qty={qty:.6f} | TradePnL={trade_pnl:.2f} | NetPnL={self.realized_pnl:.2f}")
+            self.log_trade(reason, price, trade_pnl, self.realized_pnl)
+        except Exception as e:
+            print(f"⚠️ Sell order failed: {e}")
 
     def process_new_price(self, price):
+        if price is None:
+            return  # skip if price fetch failed
+
         self.prices.append(price)
         if len(self.prices) < max(BB_WINDOW, SMA_FILTER_WINDOW):
             return
@@ -136,34 +150,44 @@ class BollingerSpotLive:
               f"NetPnL={self.realized_pnl:.2f} | Trades={self.trades}")
 
     def performance_report(self):
-        df = pd.read_csv("trade_log_live.csv")
-        closes = df[df["Action"].str.contains("SELL")]
-        total_trades = len(closes)
-        wins = len(closes[closes["TradePnL"] > 0])
-        win_rate = (wins / total_trades * 100) if total_trades else 0
-        total_pnl = df["NetPnL"].iloc[-1] if len(df) else 0
-        print("\n📊 ---- PERFORMANCE SUMMARY ----")
-        print(f"Total Trades: {total_trades}")
-        print(f"Win Rate: {win_rate:.2f}%")
-        print(f"Total P&L: {total_pnl:.2f}")
-        print(f"Symbol: {self.symbol}")
-        print("-------------------------------\n")
+        try:
+            df = pd.read_csv("trade_log_live.csv")
+            closes = df[df["Action"].str.contains("SELL")]
+            total_trades = len(closes)
+            wins = len(closes[closes["TradePnL"] > 0])
+            win_rate = (wins / total_trades * 100) if total_trades else 0
+            total_pnl = df["NetPnL"].iloc[-1] if len(df) else 0
+            print("\n📊 ---- PERFORMANCE SUMMARY ----")
+            print(f"Total Trades: {total_trades}")
+            print(f"Win Rate: {win_rate:.2f}%")
+            print(f"Total P&L: {total_pnl:.2f}")
+            print(f"Symbol: {self.symbol}")
+            print("-------------------------------\n")
+        except Exception as e:
+            print(f"⚠️ Could not generate performance report: {e}")
 
     def run(self):
         print(f"\n🚀 Running LIVE BOT for {self.symbol} (Maker Fee = 0%)")
         print("Press Ctrl + C to stop anytime.\n")
-        try:
-            while True:
+
+        while True:
+            try:
                 price = self.fetch_price()
                 self.process_new_price(price)
                 time.sleep(INTERVAL_SECS)
-        except KeyboardInterrupt:
-            print("\n🛑 Bot stopped manually.")
-            self.performance_report()
-        except Exception as e:
-            print(f"⚠️ Error: {e}")
-            time.sleep(5)
-            self.run()
+
+            except KeyboardInterrupt:
+                print("\n🛑 Bot stopped manually.")
+                self.performance_report()
+                break
+
+            except Exception as e:
+                print(f"⚠️ Error: {e}")
+                with open("error_log.txt", "a") as f:
+                    f.write(f"{datetime.utcnow()} - {e}\n")
+                time.sleep(5)
+                continue
+
 
 # -----------------------------
 # 🚀 RUN THE BOT
