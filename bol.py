@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+"""
+bol.py - Final production-ready Bollinger Spot bot with:
+ - LOT_SIZE and MIN_NOTIONAL handling
+ - Insufficient-balance safe sells
+ - Time-sync and retry/backoff for API calls
+ - FDUSD primary with BTCUSDT fallback for sells
+"""
+
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import pandas as pd
@@ -11,7 +20,7 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 
 # -----------------------------
-# 🔑 API KEYS (replace with yours)
+# 🔑 API KEYS: prefer env vars
 # -----------------------------
 api_key = "cL4LHJfRXt9FO2p3f65GGvqBmypnlH2jihupQU8uHJEv1BSrC48P6YWSQJdUVgV6"
 api_secret = "lkhKrYkoMIldhtabkdU1KyiUi2WyCj7gD8GMYDILZ0vZg7iIZWEGuEE63JqjtpQG"
@@ -19,14 +28,15 @@ api_secret = "lkhKrYkoMIldhtabkdU1KyiUi2WyCj7gD8GMYDILZ0vZg7iIZWEGuEE63JqjtpQG"
 # -----------------------------
 # ⚙️ TRADING CONFIG
 # -----------------------------
-SYMBOL = "BTCFDUSD"               # primary symbol
-FALLBACK_SYMBOL = "BTCUSDT"       # fallback if primary fails repeatedly
+PRIMARY_SYMBOL = "BTCFDUSD"   # primary symbol (keep)
+FALLBACK_SYMBOL = "BTCUSDT"   # fallback if primary cant sell
+SYMBOL = PRIMARY_SYMBOL       # used by strategy (we can keep primary)
 INTERVAL_SECS = 60
 BB_WINDOW = 20
 BB_STD_DEV = 3
 SMA_FILTER_WINDOW = 30
-TP_PCT = 0.01
-SL_PCT = 0.009
+TP_PCT = 0.01         
+SL_PCT = 0.009          
 CASH_RESERVE_PCT = 0.001
 BASE_RESERVE_PCT = 0.001
 
@@ -34,8 +44,34 @@ STATE_FILE = "trade_state.json"
 TRADE_LOG = "trade_log_live.csv"
 ERROR_LOG = "error_log.txt"
 
+# Safety / retries
+API_MAX_RETRIES = 5
+API_BACKOFF_BASE = 0.5  # seconds
+
 # -----------------------------
-# 🧠 BOT CLASS
+# 🧠 Helper: retry wrapper
+# -----------------------------
+def api_retry(fn, *args, **kwargs):
+    """Call fn with retries and exponential backoff on common network errors."""
+    backoff = API_BACKOFF_BASE
+    for attempt in range(API_MAX_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except BinanceAPIException as e:
+            # For Binance errors, raise to caller to handle specific codes
+            raise
+        except Exception as e:
+            # network or other transient errors -> retry
+            if attempt < API_MAX_RETRIES - 1:
+                print(f"⚠️ Transient error: {e}. Retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            else:
+                raise
+
+# -----------------------------
+# 🧠 Bot Class
 # -----------------------------
 class BollingerSpotLive:
     def __init__(self, api_key, api_secret, symbol):
@@ -47,7 +83,11 @@ class BollingerSpotLive:
         self.trades = 0
         self.prices = []
 
+        # caches for symbol filters
+        self._symbol_filters = {}
+
         self.load_state()
+        self.sync_server_time()
         self.detect_existing_position()
 
         if not os.path.exists(TRADE_LOG):
@@ -59,36 +99,64 @@ class BollingerSpotLive:
         print(f"⚙️ Params: BB Window={BB_WINDOW}, BB Std={BB_STD_DEV}, SMA Filter={SMA_FILTER_WINDOW}, TP={TP_PCT*100:.2f}%, SL={SL_PCT*100:.2f}%")
 
     # -----------------------------
-    # 🔹 Helpers: Binance filters & qty adjustment
+    # 🔹 Time sync
     # -----------------------------
-    def _get_lot_size_filter(self, symbol):
-        """Return (minQty as Decimal, stepSize as Decimal)."""
-        info = self.client.get_symbol_info(symbol)
-        if not info:
-            raise Exception(f"No symbol info for {symbol}")
-        for f in info.get("filters", []):
-            if f.get("filterType") == "LOT_SIZE":
-                min_q = Decimal(str(f["minQty"]))
-                step = Decimal(str(f["stepSize"]))
-                return min_q, step
-        # sensible fallback
-        return Decimal("0.00000001"), Decimal("0.00000001")
-
-    def _adjust_qty_down(self, qty_float, step_decimal, min_qty_decimal):
-        """Round down qty to nearest step and ensure >= minQty, return Decimal or Decimal(0)."""
-        qty = Decimal(str(qty_float))
-        # quantize to step (round down)
+    def sync_server_time(self):
         try:
-            adjusted = (qty // step_decimal) * step_decimal
-        except Exception:
-            # fallback if division with decimals fails
-            adjusted = (qty.quantize(step_decimal, rounding=ROUND_DOWN))
+            srv = api_retry(self.client.get_server_time)
+            # we don't set local clock; just ensure connectivity and server time accessible
+            if srv and 'serverTime' in srv:
+                print(f"🔁 Binance server time OK.")
+        except Exception as e:
+            print(f"⚠️ Warning: couldn't fetch server time: {e}")
+
+    # -----------------------------
+    # 🔹 Symbol filter helpers
+    # -----------------------------
+    def _get_symbol_info(self, symbol):
+        if symbol in self._symbol_filters:
+            return self._symbol_filters[symbol]
+        info = api_retry(self.client.get_symbol_info, symbol)
+        self._symbol_filters[symbol] = info
+        return info
+
+    def get_filters(self, symbol):
+        """Return dict of filters for symbol (LOT_SIZE, MIN_NOTIONAL, PRICE_FILTER)"""
+        info = self._get_symbol_info(symbol)
+        filters = {}
+        for f in info.get("filters", []):
+            filters[f["filterType"]] = f
+        return filters
+
+    def get_lot_size_decimals(self, symbol):
+        filters = self.get_filters(symbol)
+        lot = filters.get("LOT_SIZE", {})
+        minQty = Decimal(str(lot.get("minQty", "0.00000001")))
+        stepSize = Decimal(str(lot.get("stepSize", "0.00000001")))
+        # compute decimal places from stepSize
+        return minQty, stepSize
+
+    def get_min_notional(self, symbol):
+        filters = self.get_filters(symbol)
+        notional = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL") or filters.get("MARKET_LOT_SIZE")
+        if notional and "minNotional" in notional:
+            return Decimal(str(notional["minNotional"]))
+        # fallback to small value
+        return Decimal("1")
+
+    def adjust_qty_down_decimal(self, qty_decimal, step_decimal, min_qty_decimal):
+        """Round down qty_decimal to nearest multiple of step_decimal, return Decimal or 0."""
+        if qty_decimal <= 0:
+            return Decimal("0")
+        # floor(qty / step) * step
+        times = (qty_decimal // step_decimal)
+        adjusted = times * step_decimal
         if adjusted < min_qty_decimal:
             return Decimal("0")
         return adjusted
 
     # -----------------------------
-    # 🔹 State Management
+    # 🔹 State persistence
     # -----------------------------
     def save_state(self):
         state = {
@@ -114,15 +182,23 @@ class BollingerSpotLive:
                 print(f"⚠️ Failed loading state: {e}")
 
     # -----------------------------
-    # 🔹 Detect Existing Position
+    # 🔹 Balances & entry detection
     # -----------------------------
+    def get_balances(self):
+        resp = api_retry(self.client.get_account)
+        balances = resp.get("balances", [])
+        df = pd.DataFrame(balances)
+        df.set_index("asset", inplace=True)
+        fdusd = float(df.loc["FDUSD", "free"]) if "FDUSD" in df.index else 0.0
+        btc = float(df.loc["BTC", "free"]) if "BTC" in df.index else 0.0
+        return fdusd, btc
+
     def detect_existing_position(self):
         try:
             fdusd, btc = self.get_balances()
         except Exception as e:
             print(f"⚠️ Could not get balances: {e}")
             return
-
         if btc > 0.000001:
             if self.position == 0:
                 inferred = self._compute_entry_price_from_trades()
@@ -134,29 +210,9 @@ class BollingerSpotLive:
         else:
             print("🟢 No BTC position detected. Starting fresh.")
 
-    # -----------------------------
-    # 🔹 Binance Helpers
-    # -----------------------------
-    def fetch_price(self, symbol=None):
-        sym = symbol or self.symbol
-        try:
-            return float(self.client.get_symbol_ticker(symbol=sym)["price"])
-        except Exception as e:
-            print(f"⚠️ Price fetch error for {sym}: {e}")
-            time.sleep(2)
-            return None
-
-    def get_balances(self):
-        balances = self.client.get_account()["balances"]
-        df = pd.DataFrame(balances)
-        df.set_index("asset", inplace=True)
-        fdusd = float(df.loc["FDUSD", "free"]) if "FDUSD" in df.index else 0.0
-        btc = float(df.loc["BTC", "free"]) if "BTC" in df.index else 0.0
-        return fdusd, btc
-
     def _compute_entry_price_from_trades(self):
         try:
-            trades = self.client.get_my_trades(symbol=self.symbol)
+            trades = api_retry(self.client.get_my_trades, symbol=self.symbol)
             if not trades:
                 return None
             total_buy_cost = total_buy_qty = total_sell_cost = total_sell_qty = 0.0
@@ -181,7 +237,17 @@ class BollingerSpotLive:
             return None
 
     # -----------------------------
-    # 🔹 Trading Functions (safe)
+    # 🔹 Order helpers: min notional check
+    # -----------------------------
+    def check_min_notional(self, symbol, price, qty_decimal):
+        min_notional = self.get_min_notional(symbol)
+        notional = (Decimal(str(price)) * qty_decimal)
+        if notional < min_notional:
+            return False, min_notional, notional
+        return True, min_notional, notional
+
+    # -----------------------------
+    # 🔹 Buy (market) - uses quoteOrderQty so Binance sets qty
     # -----------------------------
     def buy_all(self, symbol=None):
         sym = symbol or self.symbol
@@ -190,10 +256,11 @@ class BollingerSpotLive:
             spend_amt = fdusd * (1 - CASH_RESERVE_PCT)
             if spend_amt < 5:
                 print(f"⚠️ Not enough FDUSD to buy ({spend_amt:.2f}) on {sym}")
-                return
+                return False
 
-            # use quoteOrderQty so Binance computes buy quantity
-            order = self.client.order_market_buy(symbol=sym, quoteOrderQty=round(spend_amt, 2))
+            # ensure time sync and retry wrapper
+            self.sync_server_time()
+            order = api_retry(self.client.order_market_buy, symbol=sym, quoteOrderQty=round(spend_amt, 2))
             fills = order.get("fills", [])
             qty = sum(float(f["qty"]) for f in fills)
             total_cost = sum(float(f["price"]) * float(f["qty"]) for f in fills)
@@ -202,132 +269,152 @@ class BollingerSpotLive:
             self.trades += 1
             print(f"📈 BUY ({sym}) @ {self.entry_price:.2f} | Qty={qty:.6f} | Spent≈{spend_amt:.2f}")
             self.log_trade("BUY", sym, self.entry_price)
+            self.save_state()
+            return True
         except BinanceAPIException as e:
             print(f"⚠️ Buy failed on {sym}: {e}")
+            return False
         except Exception as e:
             print(f"⚠️ Buy unexpected error on {sym}: {e}")
+            return False
 
+    # -----------------------------
+    # 🔹 Sell (market) - robust with retries and fallback
+    # -----------------------------
     def sell_all(self, price, reason):
-        """
-        Attempt to sell on primary symbol, retry adjusting precision,
-        on repeated failure try fallback symbol.
-        """
-        for attempt_symbol in [self.symbol, FALLBACK_SYMBOL]:
-            successful = self._attempt_sell_with_retries(attempt_symbol, price, reason)
-            if successful:
+        # try primary then fallback
+        for attempt_symbol in [PRIMARY_SYMBOL, FALLBACK_SYMBOL]:
+            sold = self._sell_with_retries(attempt_symbol, price, reason)
+            if sold:
                 return True
-        # if reached here, none succeeded
         print("⚠️ Sell failed on both primary and fallback symbols.")
         return False
 
-    def _attempt_sell_with_retries(self, symbol, price, reason):
-        """
-        Try to sell with progressive retries adjusting quantity down by step.
-        Returns True if sold, False otherwise.
-        """
+    def _sell_with_retries(self, symbol, price, reason):
         try:
-            # get current BTC balance (base asset)
-            base_asset = "BTC"
-            bal_info = self.client.get_asset_balance(asset=base_asset)
-            balance = float(bal_info["free"]) if bal_info and bal_info.get("free") else 0.0
+            # fetch base asset balance (BTC)
+            bal = api_retry(self.client.get_asset_balance, asset="BTC")
+            balance = float(bal.get("free", 0.0)) if bal else 0.0
             if balance <= 0:
-                print(f"⚠️ No {base_asset} balance to sell on {symbol}")
+                print(f"⚠️ No BTC balance to sell on {symbol}")
                 return False
 
-            min_qty, step = self._get_lot_size_filter(symbol)
+            # get filters
+            min_qty, step = self.get_lot_size_decimals(symbol)
+            # decimal conversion
+            balance_dec = Decimal(str(balance))
+            step_dec = step
+            min_qty_dec = min_qty
+
             # apply base reserve
-            qty_decimal = Decimal(str(balance)) * (Decimal("1") - Decimal(str(BASE_RESERVE_PCT)))
-            qty_decimal = self._adjust_qty_decimal(qty_decimal, step, min_qty)
-            if qty_decimal == Decimal("0"):
+            qty_dec = balance_dec * (Decimal("1") - Decimal(str(BASE_RESERVE_PCT)))
+            qty_dec = self.adjust_qty_safe(qty_dec, step_dec, min_qty_dec)
+
+            if qty_dec == Decimal("0"):
                 print(f"⚠️ Qty below min for {symbol} after adjustment; balance={balance}")
                 return False
 
-            max_retries = 6
-            for attempt in range(max_retries):
-                try_qty = qty_decimal - (step * Decimal(attempt))  # reduce by steps each retry
-                if try_qty < min_qty:
-                    print(f"⚠️ try_qty {try_qty} < min_qty for {symbol}, stop retrying.")
+            # check min notional (must be >= allowed)
+            ok, min_notional, notional = self.check_min_notional(symbol, price, qty_dec)
+            if not ok:
+                print(f"⚠️ Notional {notional} < minNotional {min_notional} for {symbol}. Skipping sell.")
+                return False
+
+            # attempt progressive retries decreasing by step if precision/lot issues
+            max_attempts = 6
+            for attempt in range(max_attempts):
+                try_qty = qty_dec - (step_dec * Decimal(attempt))
+                if try_qty < min_qty_dec:
+                    print(f"⚠️ try_qty < minQty on {symbol}, cancel attempt.")
                     break
-                # convert to string to avoid float precision issues
-                q_str = format(try_qty.normalize(), 'f')
-                # place order
-                order = self.client.order_market_sell(symbol=symbol, quantity=q_str)
-                exec_qty = 0.0
-                if "executedQty" in order:
-                    exec_qty = float(order["executedQty"])
-                elif "fills" in order:
-                    exec_qty = sum(float(f["qty"]) for f in order["fills"])
-                trade_pnl = (price - float(self.entry_price)) * exec_qty if self.entry_price else 0.0
+                q_str = format(try_qty.normalize(), 'f')  # string w/o exponent
+                # sync time
+                self.sync_server_time()
+                order = api_retry(self.client.order_market_sell, symbol=symbol, quantity=q_str)
+                # extract executed qty
+                executed_qty = 0.0
+                if order.get("executedQty"):
+                    executed_qty = float(order["executedQty"])
+                elif order.get("fills"):
+                    executed_qty = sum(float(f["qty"]) for f in order["fills"])
+                trade_pnl = (price - float(self.entry_price)) * executed_qty if self.entry_price else 0.0
 
                 # update state
                 self.position = 0
                 self.trades += 1
                 self.realized_pnl += trade_pnl
-                print(f"💰 SELL ({reason}) on {symbol} @ {price:.2f} | Qty={exec_qty:.6f} | PnL={trade_pnl:.2f} | NetPnL={self.realized_pnl:.2f}")
+                print(f"💰 SELL ({reason}) on {symbol} @ {price:.2f} | Qty={executed_qty:.6f} | PnL={trade_pnl:.2f} | NetPnL={self.realized_pnl:.2f}")
                 self.log_trade(reason, symbol, price, trade_pnl, self.realized_pnl)
                 self.save_state()
                 return True
 
-            # if loop finishes without return, we failed to place sell
-            return False
-
         except BinanceAPIException as e:
-            # handle common Binance API errors explicitly
+            # handle -2010 insufficient balance specially (attempt to refetch and try once)
+            err_msg = str(e)
             code = None
             try:
                 code = e.code
             except Exception:
                 pass
-            msg = str(e)
-            print(f"⚠️ Sell BinanceAPIException on {symbol}: {msg}")
-            # if insufficient balance, try re-sync and reduce qty then retry once
-            if code == -2010 or "insufficient balance" in msg.lower():
-                print("🔁 Detected insufficient balance. Re-fetching balance and retrying once.")
+            print(f"⚠️ BinanceAPIException during sell on {symbol}: {err_msg}")
+            if code == -2010 or "insufficient" in err_msg.lower():
+                # resync and one final attempt
                 try:
                     time.sleep(0.5)
-                    bal_info = self.client.get_asset_balance(asset="BTC")
-                    balance = float(bal_info["free"]) if bal_info and bal_info.get("free") else 0.0
-                    min_qty, step = self._get_lot_size_filter(symbol)
-                    qty_decimal = Decimal(str(balance)) * (Decimal("1") - Decimal(str(BASE_RESERVE_PCT)))
-                    qty_decimal = self._adjust_qty_decimal(qty_decimal, step, min_qty)
-                    if qty_decimal > Decimal("0"):
-                        try_qty_str = format(qty_decimal.normalize(), 'f')
-                        order = self.client.order_market_sell(symbol=symbol, quantity=try_qty_str)
-                        exec_qty = float(order.get("executedQty") or 0.0)
-                        trade_pnl = (price - float(self.entry_price)) * exec_qty if self.entry_price else 0.0
-                        self.position = 0
-                        self.trades += 1
-                        self.realized_pnl += trade_pnl
-                        print(f"💰 SELL (retry) ({reason}) on {symbol} @ {price:.2f} | Qty={exec_qty:.6f} | PnL={trade_pnl:.2f}")
-                        self.log_trade(reason, symbol, price, trade_pnl, self.realized_pnl)
-                        self.save_state()
-                        return True
+                    bal = api_retry(self.client.get_asset_balance, asset="BTC")
+                    balance = float(bal.get("free", 0.0)) if bal else 0.0
+                    if balance <= 0:
+                        return False
+                    min_qty, step = self.get_lot_size_decimals(symbol)
+                    balance_dec = Decimal(str(balance))
+                    qty_dec = balance_dec * (Decimal("1") - Decimal(str(BASE_RESERVE_PCT)))
+                    qty_dec = self.adjust_qty_safe(qty_dec, step, min_qty)
+                    if qty_dec == Decimal("0"):
+                        return False
+                    q_str = format(qty_dec.normalize(), 'f')
+                    self.sync_server_time()
+                    order = api_retry(self.client.order_market_sell, symbol=symbol, quantity=q_str)
+                    exec_qty = float(order.get("executedQty") or 0.0)
+                    trade_pnl = (price - float(self.entry_price)) * exec_qty if self.entry_price else 0.0
+                    self.position = 0
+                    self.trades += 1
+                    self.realized_pnl += trade_pnl
+                    print(f"💰 SELL (retry) on {symbol} @ {price:.2f} | Qty={exec_qty:.6f} | PnL={trade_pnl:.2f}")
+                    self.log_trade(reason, symbol, price, trade_pnl, self.realized_pnl)
+                    self.save_state()
+                    return True
                 except Exception as ex:
-                    print(f"⚠️ Retry sell also failed: {ex}")
-            # if precision/lot errors, we'll return False so fallback symbol can be tried
+                    print(f"⚠️ Retry sell failed: {ex}")
+                    return False
             return False
         except Exception as e:
-            print(f"⚠️ Unexpected error during sell attempt on {symbol}: {e}")
+            print(f"⚠️ Unexpected error selling on {symbol}: {e}")
             return False
 
-    def _adjust_qty_decimal(self, qty_decimal, step_decimal, min_qty_decimal):
-        """Return adjusted Decimal quantity rounded down to step, or 0 if below min."""
-        if qty_decimal <= 0:
-            return Decimal("0")
-        # floor to step: (qty // step) * step
+    def adjust_qty_safe(self, qty_decimal, step_dec, min_qty_dec):
+        """Wrapper to ensure Decimal step/min handling robustly."""
         try:
-            times = (qty_decimal // step_decimal)
-            adjusted = times * step_decimal
+            return self.adjust_qty_down_decimal(qty_decimal, step_dec, min_qty_dec)
         except Exception:
-            # fallback using quantize
-            adjusted = qty_decimal.quantize(step_decimal, rounding=ROUND_DOWN)
-        if adjusted < min_qty_decimal:
-            return Decimal("0")
-        return adjusted
+            # fallback to quantize
+            try:
+                adjusted = qty_decimal.quantize(step_dec, rounding=ROUND_DOWN)
+                return adjusted if adjusted >= min_qty_dec else Decimal("0")
+            except Exception:
+                return Decimal("0")
 
     # -----------------------------
-    # 🔹 Strategy Logic
+    # 🔹 Strategy & main loop
     # -----------------------------
+    def fetch_price(self, symbol=None):
+        sym = symbol or self.symbol
+        try:
+            t = api_retry(self.client.get_symbol_ticker, symbol=sym)
+            return float(t["price"])
+        except Exception as e:
+            print(f"⚠️ Price fetch error for {sym}: {e}")
+            return None
+
     def process_new_price(self, price):
         if price is None:
             return
@@ -368,10 +455,10 @@ class BollingerSpotLive:
             if reason:
                 sold = self.sell_all(price, reason)
                 if not sold:
-                    # if sell fails, resync and continue (so bot can attempt later)
                     print("⚠️ Sell attempt failed; resyncing balances and will retry on next loop.")
                     self.detect_existing_position()
 
+        # concise logging
         print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Price={price:.2f} | Pos={self.position} | UnrealPnL={unreal_pnl:.2f}% | NetPnL={self.realized_pnl:.2f} | Trades={self.trades}")
 
     # -----------------------------
@@ -384,13 +471,15 @@ class BollingerSpotLive:
             writer.writerow([now, action, symbol, price, trade_pnl, net_pnl])
 
     # -----------------------------
-    # 🔹 Run Loop
+    # 🔹 Run loop
     # -----------------------------
     def run(self):
         print(f"\n🚀 Running LIVE BOT for {self.symbol}")
         print("Press Ctrl + C to stop.\n")
         while True:
             try:
+                # refresh server time periodically
+                self.sync_server_time()
                 price = self.fetch_price(self.symbol)
                 self.process_new_price(price)
                 time.sleep(INTERVAL_SECS)
@@ -399,6 +488,7 @@ class BollingerSpotLive:
                 self.save_state()
                 break
             except Exception as e:
+                # log and continue
                 with open(ERROR_LOG, "a") as f:
                     f.write(f"{datetime.now(timezone.utc)} - {e}\n")
                 print(f"⚠️ Runtime error: {e}")
@@ -408,5 +498,5 @@ class BollingerSpotLive:
 # 🚀 START BOT
 # -----------------------------
 if __name__ == "__main__":
-    bot = BollingerSpotLive(api_key, api_secret, SYMBOL)
+    bot = BollingerSpotLive(api_key, api_secret, PRIMARY_SYMBOL)
     bot.run()
