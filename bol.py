@@ -57,6 +57,23 @@ class BollingerSpotLive:
         print(f"⚙️ Params: BB Window={BB_WINDOW}, BB Std={BB_STD_DEV}, SMA Filter={SMA_FILTER_WINDOW}, TP={TP_PCT*100:.1f}%, SL={SL_PCT*100:.1f}%")
 
     # -----------------------------
+    # 🔹 Helpers for Binance rules
+    # -----------------------------
+    def get_lot_size_info(self):
+        info = self.client.get_symbol_info(self.symbol)
+        for f in info["filters"]:
+            if f["filterType"] == "LOT_SIZE":
+                return float(f["minQty"]), float(f["stepSize"])
+        return 0.0, 0.000001
+
+    def adjust_qty(self, qty):
+        min_qty, step = self.get_lot_size_info()
+        qty = math.floor(qty / step) * step
+        if qty < min_qty:
+            return 0
+        return float(qty)
+
+    # -----------------------------
     # 🔹 State Management
     # -----------------------------
     def save_state(self):
@@ -172,10 +189,15 @@ class BollingerSpotLive:
         try:
             _, btc = self.get_balances()
             qty = btc * (1 - BASE_RESERVE_PCT)
-            qty = math.floor(qty * 1e6) / 1e6  # round down to 6 decimals
-            if qty < 0.00001:
-                print(f"⚠️ Not enough BTC to sell (qty={qty:.6f})")
+            qty = self.adjust_qty(qty)
+
+            if qty == 0:
+                print(f"⚠️ Qty below minimum LOT_SIZE, skipping sell.")
                 return
+
+            balance = float(self.client.get_asset_balance(asset="BTC")["free"])
+            if qty > balance:
+                qty = self.adjust_qty(balance)
 
             order = self.client.order_market_sell(symbol=self.symbol, quantity=qty)
             trade_pnl = (price - float(self.entry_price)) * qty if self.entry_price else 0.0
