@@ -22,11 +22,11 @@ api_secret = "lkhKrYkoMIldhtabkdU1KyiUi2WyCj7gD8GMYDILZ0vZg7iIZWEGuEE63JqjtpQG"
 SYMBOL = "BTCFDUSD"               # primary symbol
 FALLBACK_SYMBOL = "BTCUSDT"       # fallback if primary fails repeatedly
 INTERVAL_SECS = 60
-BB_WINDOW = 41
+BB_WINDOW = 20
 BB_STD_DEV = 3
-SMA_FILTER_WINDOW = 49
-TP_PCT = 0.007
-SL_PCT = 0.03
+SMA_FILTER_WINDOW = 30
+TP_PCT = 0.01
+SL_PCT = 0.009
 CASH_RESERVE_PCT = 0.001
 BASE_RESERVE_PCT = 0.001
 
