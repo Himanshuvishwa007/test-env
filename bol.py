@@ -13,8 +13,8 @@ from datetime import datetime, timezone
 # -----------------------------
 # 🔑 API KEYS (replace with yours)
 # -----------------------------
-api_key = "cL4LHJfRXt9FO2p3f65-nlH2jihupQU8uHJEv1BSrC48P6YWSQJdUVgV6"
-api_secret = "lkhKrYkoMIldhtabkdU-yCj7gD8GMYDILZ0vZg7iIZWEGuEE63JqjtpQG"
+api_key = "cL4LHJfRXt9FO2p3f65GGvqBmypnlH2jihupQU8uHJEv1BSrC48P6YWSQJdUVgV6"
+api_secret = "lkhKrYkoMIldhtabkdU1KyiUi2WyCj7gD8GMYDILZ0vZg7iIZWEGuEE63JqjtpQG"
 
 # -----------------------------
 # ⚙️ TRADING CONFIG
