@@ -8,10 +8,9 @@ from datetime import datetime
 # -----------------------------
 # Binance Testnet (Paper)
 # -----------------------------
-api_key = "YOUR_KEY"
-api_secret = "YOUR_SECRET"
-
-
+api_key = "YMkkDGSM5Euk3NsAt21WcRhFFvm70559lMh1hsD79tQ0ayqPnctslCpFuEMA5R2yD"
+api_secret = "oER1r73vKVvdWf5cJ0Hn7aOq4R1Pe3HAlciVgyur0TMZ9j0tqP5wUk1YwDLPazRD"
+client = Client(api_key, api_secret, testnet=True)
 class BB_RSI_Volume_PaperBot:
 
     def __init__(
@@ -225,16 +224,16 @@ bot = BB_RSI_Volume_PaperBot(
     api_secret,
     symbol="BTCUSDT",
 
-    bb_window=20,
-    bb_std=2.5,
-    rsi_period=14,
+    bb_window=39,
+    bb_std=3,
+    rsi_period=15,
 
-    vol_window=20,
+    vol_window=27,
     vol_multiplier=1.5,
-    trend_sma=50,
+    trend_sma=49,
 
     tp_pct=0.07,
     sl_pct=0.03
 )
 
-bot.run(86400)
+bot.run(864000)
