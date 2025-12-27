@@ -1,6 +1,5 @@
 from binance.client import Client
 import pandas as pd
-import numpy as np
 import time
 import csv
 from datetime import datetime
@@ -11,41 +10,31 @@ from datetime import datetime
 API_KEY = "YMkkDGSM5Euk3NsAt21WcRhFFvm70559lMh1hsD79tQ0ayqPnctslCpFuEMA5R2yD"
 API_SECRET = "oER1r73vKVvdWf5cJ0Hn7aOq4R1Pe3HAlciVgyur0TMZ9j0tqP5wUk1YwDLPazRD"
 
-# =============================
-# BOT CLASS
-# =============================
-class BB_RSI_Volume_PaperBot:
+class BB_RSI_EMA200_PaperBot:
 
     def __init__(
         self,
         api_key,
         api_secret,
         symbol="BTCUSDT",
-        interval=Client.KLINE_INTERVAL_1MINUTE,
+        interval=Client.KLINE_INTERVAL_5MINUTE,
 
-        # ---- Bollinger Bands ----
         bb_window=20,
         bb_std=2.0,
 
-        # ---- RSI ----
         rsi_period=14,
         rsi_buy=40,
-        rsi_sell=60,
+        rsi_sell=65,
 
-        # ---- Volume Filter ----
         vol_window=20,
         vol_multiplier=1.1,
 
-        # ---- Trend Filter ----
-        trend_sma=30,
+        ema_trend=200,
 
-        # ---- Risk ----
-        tp_pct=0.07,
-        sl_pct=0.03,
+        tp_pct=0.02,
+        sl_pct=0.02,
         fee=0.001,
 
-        # ---- Misc ----
-        initial_cash=10000,
         debug=True
     ):
 
@@ -62,33 +51,25 @@ class BB_RSI_Volume_PaperBot:
 
         self.vol_window = vol_window
         self.vol_multiplier = vol_multiplier
-        self.trend_sma = trend_sma
+        self.ema_trend = ema_trend
 
         self.tp_pct = tp_pct
         self.sl_pct = sl_pct
         self.fee = fee
 
-        self.initial_cash = initial_cash
         self.position = 0
         self.entry_price = None
         self.realized_pnl = 0
-        self.trades = 0
 
-        self.debug = debug
         self.data = pd.DataFrame()
+        self.debug = debug
 
-        with open("trade_log_bb_rsi_volume.csv", "w", newline="") as f:
+        with open("trade_log.csv", "w", newline="") as f:
             csv.writer(f).writerow(
                 ["Time", "Action", "Price", "TradePnL", "NetPnL"]
             )
 
-        print("✅ BB + RSI + Volume PAPER BOT STARTED")
-        print(
-            f"BB({bb_window},{bb_std}) | "
-            f"RSI(period={rsi_period}, buy<{rsi_buy}, sell>{rsi_sell}) | "
-            f"Vol x{vol_multiplier} | Trend SMA({trend_sma}) | "
-            f"TP {tp_pct*100:.1f}% | SL {sl_pct*100:.1f}%"
-        )
+        print("✅ EMA200 + BB + RSI + Volume PAPER BOT STARTED")
 
     # =============================
     # RSI
@@ -121,7 +102,7 @@ class BB_RSI_Volume_PaperBot:
         }
 
     # =============================
-    # Strategy Logic
+    # STRATEGY
     # =============================
     def process(self):
         candle = self.fetch_candle()
@@ -134,7 +115,7 @@ class BB_RSI_Volume_PaperBot:
             self.bb_window,
             self.rsi_period,
             self.vol_window,
-            self.trend_sma
+            self.ema_trend
         )
 
         if len(self.data) < min_len:
@@ -143,41 +124,35 @@ class BB_RSI_Volume_PaperBot:
         df = self.data.copy()
 
         # ---- Indicators ----
-        df["SMA"] = df["close"].rolling(self.bb_window).mean()
-        df["STD"] = df["close"].rolling(self.bb_window).std()
-        df["Upper"] = df["SMA"] + self.bb_std * df["STD"]
-        df["Lower"] = df["SMA"] - self.bb_std * df["STD"]
-
         df["RSI"] = self.compute_rsi(df["close"])
-        df["Vol_SMA"] = df["volume"].rolling(self.vol_window).mean()
-        df["Trend_SMA"] = df["close"].rolling(self.trend_sma).mean()
+        df["VOL_SMA"] = df["volume"].rolling(self.vol_window).mean()
+
+        sma = df["close"].rolling(self.bb_window).mean()
+        std = df["close"].rolling(self.bb_window).std()
+        df["BB_LOW"] = sma - self.bb_std * std
+
+        df["EMA200"] = df["close"].ewm(
+            span=self.ema_trend, adjust=False
+        ).mean()
 
         last = df.iloc[-1]
         price = last["close"]
 
-        # ---- BUY ----
-        buy_signal = (
-            price < last["Lower"] and
-            last["RSI"] < self.rsi_buy and
-            last["volume"] > last["Vol_SMA"] * self.vol_multiplier and
-            price > last["Trend_SMA"]
-        )
+        # ================= BUY =================
+        if self.position == 0:
+            if (
+                price > last["EMA200"] and
+                last["RSI"] < self.rsi_buy and
+                price < last["BB_LOW"] and
+                last["volume"] > last["VOL_SMA"] * self.vol_multiplier
+            ):
+                self.position = 1
+                self.entry_price = price
+                self.log("BUY", price, 0)
+                print(f"📈 BUY @ {price:.2f}")
 
-        # ---- SELL ----
-        sell_signal = (
-            price > last["SMA"] or
-            last["RSI"] > self.rsi_sell
-        )
-
-        # ---- EXECUTION ----
-        if buy_signal and self.position == 0:
-            self.position = 1
-            self.entry_price = price
-            self.trades += 1
-            self.log("BUY", price, 0)
-            print(f"📈 BUY @ {price:.2f}")
-
-        elif self.position == 1:
+        # ================= SELL =================
+        else:
             tp = self.entry_price * (1 + self.tp_pct)
             sl = self.entry_price * (1 - self.sl_pct)
 
@@ -185,14 +160,14 @@ class BB_RSI_Volume_PaperBot:
             reason = None
 
             if price >= tp:
-                exit_price = tp
+                exit_price = price
                 reason = "TAKE_PROFIT"
             elif price <= sl:
-                exit_price = sl
-                reason = "STOP_LOSS"
-            elif sell_signal:
                 exit_price = price
-                reason = "SELL_SIGNAL"
+                reason = "STOP_LOSS"
+            elif last["RSI"] > self.rsi_sell:
+                exit_price = price
+                reason = "RSI_EXIT"
 
             if reason:
                 gross = exit_price - self.entry_price
@@ -201,26 +176,23 @@ class BB_RSI_Volume_PaperBot:
 
                 self.realized_pnl += pnl
                 self.position = 0
-                self.trades += 1
 
                 self.log(reason, exit_price, pnl)
                 print(
                     f"💰 {reason} @ {exit_price:.2f} | "
-                    f"TradePnL={pnl:.2f} | NetPnL={self.realized_pnl:.2f}"
+                    f"PnL={pnl:.2f} | Net={self.realized_pnl:.2f}"
                 )
 
-        # ---- DEBUG HEARTBEAT ----
         if self.debug:
             print(
                 f"[{datetime.utcnow().strftime('%H:%M:%S')}] "
                 f"P={price:.2f} | "
                 f"RSI={last['RSI']:.1f} | "
-                f"BB_L={last['Lower']:.2f} | "
-                f"VolRatio={(last['volume']/last['Vol_SMA']):.2f}"
+                f"EMA200={last['EMA200']:.2f}"
             )
 
     def log(self, action, price, trade_pnl):
-        with open("trade_log_bb_rsi_volume.csv", "a", newline="") as f:
+        with open("trade_log.csv", "a", newline="") as f:
             csv.writer(f).writerow([
                 datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 action,
@@ -229,38 +201,36 @@ class BB_RSI_Volume_PaperBot:
                 round(self.realized_pnl, 2)
             ])
 
-    # =============================
-    # Runner
-    # =============================
     def run(self):
         print("\n🚀 Bot Running (Paper Trading)\n")
         while True:
             try:
                 self.process()
-                time.sleep(60)
+                time.sleep(300)  # 5m candle
             except Exception as e:
                 print("⚠️ Error:", e)
                 time.sleep(10)
 
-
 # =============================
-# START BOT
+# START
 # =============================
-bot = BB_RSI_Volume_PaperBot(
+bot = BB_RSI_EMA200_PaperBot(
     API_KEY,
     API_SECRET,
     symbol="BTCUSDT",
+    interval=Client.KLINE_INTERVAL_5MINUTE,
 
     bb_window=20,
-    bb_std=2.0,
+    bb_std=2.4,          # ✅ from grid
 
     rsi_period=14,
-    rsi_buy=40,
-    rsi_sell=60,
+    rsi_buy=45,          # ✅ from grid
+    rsi_sell=75,         # ✅ from grid
 
     vol_window=20,
-    vol_multiplier=1.1,
-    trend_sma=30,
+    vol_multiplier=1.2, # ✅ from grid
+
+    ema_trend=200,
 
     tp_pct=0.07,
     sl_pct=0.03,
@@ -269,3 +239,4 @@ bot = BB_RSI_Volume_PaperBot(
 )
 
 bot.run()
+
