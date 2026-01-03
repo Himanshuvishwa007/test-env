@@ -1,6 +1,5 @@
 from binance.client import Client
 import pandas as pd
-import numpy as np
 import time
 import csv
 from datetime import datetime
@@ -16,10 +15,10 @@ client = Client(API_KEY, API_SECRET, testnet=True)
 # =============================
 # CONFIG (FROZEN)
 # =============================
-SYMBOL = "BTCUSDT"
+SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
-INITIAL_BALANCE = 10000
+INITIAL_BALANCE = 10000.0
 LEVERAGE = 2
 
 MAKER_FEE = 0.0005   # 0.05%
@@ -34,8 +33,8 @@ VOL_MULT = 1.3
 RSI_LONG_MIN = 54
 RSI_SHORT_MAX = 46
 
-KLINE_SLEEP = 300     # 5m candle
-TICK_SLEEP = 10       # tick risk management (10 sec)
+KLINE_SLEEP = 300     # 5 minutes
+TICK_SLEEP = 10       # risk check every 10 sec
 
 # =============================
 # INDICATORS
@@ -71,7 +70,7 @@ class MomentumFuturesPaperBot:
             ])
 
         print("✅ Momentum Futures Paper Bot STARTED")
-        print("📌 Strategy frozen | Klines for entry | Tick for risk only\n")
+        print("📌 ETHUSDT | 2× leverage | Realistic risk model\n")
 
     # -------------------------
     # DATA
@@ -103,7 +102,7 @@ class MomentumFuturesPaperBot:
     # -------------------------
     def log_trade(self, side, exit_price, trade_pnl):
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        equity = INITIAL_BALANCE + self.realized_pnl
+        equity = self.balance
 
         with open("trade_log_momentum_futures.csv", "a", newline="") as f:
             writer = csv.writer(f)
@@ -113,7 +112,7 @@ class MomentumFuturesPaperBot:
             ])
 
     # -------------------------
-    # ENTRY (5m candles)
+    # ENTRY (UNCHANGED)
     # -------------------------
     def check_entry(self):
         df = self.fetch_klines()
@@ -147,7 +146,7 @@ class MomentumFuturesPaperBot:
                 print(f"📉 SHORT @ {price:.2f}")
 
     # -------------------------
-    # RISK MGMT (tick by tick)
+    # REALISTIC RISK MANAGEMENT
     # -------------------------
     def manage_risk(self):
         if self.position is None:
@@ -155,15 +154,19 @@ class MomentumFuturesPaperBot:
 
         price = self.fetch_tick_price()
 
+        # realistic futures position sizing
+        position_size = (self.balance * LEVERAGE) / self.entry_price
+
         if self.position == "LONG":
             tp = self.entry_price * (1 + TP_PCT)
             sl = self.entry_price * (1 - SL_PCT)
 
             if price >= tp or price <= sl:
-                gross = (price - self.entry_price) * LEVERAGE
-                fee = (self.entry_price + price) * LEVERAGE * MAKER_FEE
+                gross = (price - self.entry_price) * position_size
+                fee = (self.entry_price + price) * position_size * MAKER_FEE
                 pnl = gross - fee
 
+                self.balance += pnl
                 self.realized_pnl += pnl
                 self.trades += 1
 
@@ -176,10 +179,11 @@ class MomentumFuturesPaperBot:
             sl = self.entry_price * (1 + SL_PCT)
 
             if price <= tp or price >= sl:
-                gross = (self.entry_price - price) * LEVERAGE
-                fee = (self.entry_price + price) * LEVERAGE * MAKER_FEE
+                gross = (self.entry_price - price) * position_size
+                fee = (self.entry_price + price) * position_size * MAKER_FEE
                 pnl = gross - fee
 
+                self.balance += pnl
                 self.realized_pnl += pnl
                 self.trades += 1
 
@@ -188,29 +192,25 @@ class MomentumFuturesPaperBot:
                 self.position = None
 
     # -------------------------
-    # RUN LOOP (ALWAYS ON)
+    # RUN LOOP
     # -------------------------
     def run(self):
         print("🚀 Bot running (Always ON)\n")
-
         last_kline_check = 0
 
         while True:
             try:
                 now = time.time()
 
-                # Entry logic every 5 minutes
                 if now - last_kline_check >= KLINE_SLEEP:
                     self.check_entry()
                     last_kline_check = now
 
-                # Risk management every 10 seconds
                 self.manage_risk()
 
-                equity = INITIAL_BALANCE + self.realized_pnl
                 print(
-                    f"[Tick] Pos={self.position} | NetPnL={self.realized_pnl:.2f} "
-                    f"| Equity={equity:.2f} | Trades={self.trades}"
+                    f"[Tick] Pos={self.position} | Balance={self.balance:.2f} "
+                    f"| NetPnL={self.realized_pnl:.2f} | Trades={self.trades}"
                 )
 
                 time.sleep(TICK_SLEEP)
