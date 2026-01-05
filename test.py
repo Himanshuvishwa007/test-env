@@ -21,9 +21,12 @@ INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 INITIAL_BALANCE = 10000.0
 LEVERAGE = 2
 
-MAKER_FEE = 0.0005   # 0.05%
-TP_PCT = 0.008       # 0.8%
-SL_PCT = 0.004       # 0.4%
+TAKER_FEE = 0.0007     # realistic futures taker fee
+TP_PCT = 0.008         # 0.8%
+SL_PCT = 0.004         # 0.4%
+HARD_SL_PCT = 0.005    # 0.5% absolute cap
+
+MAX_HOLD_SECONDS = 45 * 60
 
 EMA_TREND = 50
 RSI_PERIOD = 14
@@ -33,8 +36,8 @@ VOL_MULT = 1.3
 RSI_LONG_MIN = 54
 RSI_SHORT_MAX = 46
 
-KLINE_SLEEP = 300     # 5 minutes
-TICK_SLEEP = 10       # risk check every 10 sec
+KLINE_SLEEP = 300      # 5 min
+TICK_SLEEP = 5         # tick risk loop
 
 # =============================
 # INDICATORS
@@ -55,12 +58,13 @@ class MomentumFuturesPaperBot:
 
     def __init__(self):
         self.balance = INITIAL_BALANCE
-        self.position = None          # LONG / SHORT
+        self.position = None
         self.entry_price = None
         self.entry_time = None
 
         self.realized_pnl = 0.0
         self.trades = 0
+        self.last_kline_time = None
 
         with open("trade_log_momentum_futures.csv", "w", newline="") as f:
             writer = csv.writer(f)
@@ -70,7 +74,7 @@ class MomentumFuturesPaperBot:
             ])
 
         print("✅ Momentum Futures Paper Bot STARTED")
-        print("📌 ETHUSDT | 2× leverage | Realistic risk model\n")
+        print("📌 ETHUSDT | 2× leverage | Tick-synced risk\n")
 
     # -------------------------
     # DATA
@@ -100,94 +104,122 @@ class MomentumFuturesPaperBot:
     # -------------------------
     # LOGGING
     # -------------------------
-    def log_trade(self, side, exit_price, trade_pnl):
+    def log_trade(self, side, exit_price, pnl):
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        equity = self.balance
 
         with open("trade_log_momentum_futures.csv", "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
                 now, side, self.entry_price, exit_price,
-                trade_pnl, self.realized_pnl, equity
+                pnl, self.realized_pnl, self.balance
             ])
 
     # -------------------------
-    # ENTRY (UNCHANGED)
+    # ENTRY (5-MIN SYNCED)
     # -------------------------
     def check_entry(self):
         df = self.fetch_klines()
+        last = df.iloc[-2]  # last CLOSED candle
+
+        if self.last_kline_time == last["time"]:
+            return
+
+        self.last_kline_time = last["time"]
 
         df["EMA"] = df["close"].ewm(span=EMA_TREND, adjust=False).mean()
         df["RSI"] = rsi(df["close"], RSI_PERIOD)
         df["VOL_SMA"] = df["volume"].rolling(VOL_WINDOW).mean()
 
-        last = df.iloc[-1]
+        if self.position is not None:
+            return
+
         price = last["close"]
 
-        if self.position is None:
-            if (
-                price > last["EMA"] and
-                last["RSI"] > RSI_LONG_MIN and
-                last["volume"] > last["VOL_SMA"] * VOL_MULT
-            ):
-                self.position = "LONG"
-                self.entry_price = price
-                self.entry_time = last["time"]
-                print(f"📈 LONG @ {price:.2f}")
+        if (
+            price > df.iloc[-2]["EMA"] and
+            last["RSI"] > RSI_LONG_MIN and
+            last["volume"] > df.iloc[-2]["VOL_SMA"] * VOL_MULT
+        ):
+            self.position = "LONG"
+            self.entry_price = price
+            self.entry_time = time.time()
+            print(f"📈 LONG @ {price:.2f}")
 
-            elif (
-                price < last["EMA"] and
-                last["RSI"] < RSI_SHORT_MAX and
-                last["volume"] > last["VOL_SMA"] * VOL_MULT
-            ):
-                self.position = "SHORT"
-                self.entry_price = price
-                self.entry_time = last["time"]
-                print(f"📉 SHORT @ {price:.2f}")
+        elif (
+            price < df.iloc[-2]["EMA"] and
+            last["RSI"] < RSI_SHORT_MAX and
+            last["volume"] > df.iloc[-2]["VOL_SMA"] * VOL_MULT
+        ):
+            self.position = "SHORT"
+            self.entry_price = price
+            self.entry_time = time.time()
+            print(f"📉 SHORT @ {price:.2f}")
 
     # -------------------------
-    # REALISTIC RISK MANAGEMENT
+    # TICK-BY-TICK RISK
     # -------------------------
     def manage_risk(self):
         if self.position is None:
             return
 
         price = self.fetch_tick_price()
+        hold_time = time.time() - self.entry_time
 
-        # realistic futures position sizing
         position_size = (self.balance * LEVERAGE) / self.entry_price
 
         if self.position == "LONG":
             tp = self.entry_price * (1 + TP_PCT)
             sl = self.entry_price * (1 - SL_PCT)
+            hard_sl = self.entry_price * (1 - HARD_SL_PCT)
 
-            if price >= tp or price <= sl:
+            exit_reason = None
+            if price >= tp:
+                exit_reason = "TP"
+            elif price <= sl:
+                exit_reason = "SL"
+            elif price <= hard_sl:
+                exit_reason = "HARD_SL"
+            elif hold_time >= MAX_HOLD_SECONDS:
+                exit_reason = "TIME"
+
+            if exit_reason:
                 gross = (price - self.entry_price) * position_size
-                fee = (self.entry_price + price) * position_size * MAKER_FEE
+                fee = (self.entry_price + price) * position_size * TAKER_FEE
                 pnl = gross - fee
 
                 self.balance += pnl
                 self.realized_pnl += pnl
                 self.trades += 1
 
-                print(f"💰 EXIT LONG @ {price:.2f} | PnL={pnl:.2f}")
+                print(f"💰 EXIT LONG ({exit_reason}) @ {price:.2f} | PnL={pnl:.2f}")
                 self.log_trade("LONG", price, pnl)
                 self.position = None
 
         elif self.position == "SHORT":
             tp = self.entry_price * (1 - TP_PCT)
             sl = self.entry_price * (1 + SL_PCT)
+            hard_sl = self.entry_price * (1 + HARD_SL_PCT)
 
-            if price <= tp or price >= sl:
+            exit_reason = None
+            if price <= tp:
+                exit_reason = "TP"
+            elif price >= sl:
+                exit_reason = "SL"
+            elif price >= hard_sl:
+                exit_reason = "HARD_SL"
+            elif hold_time >= MAX_HOLD_SECONDS:
+                exit_reason = "TIME"
+
+            if exit_reason:
                 gross = (self.entry_price - price) * position_size
-                fee = (self.entry_price + price) * position_size * MAKER_FEE
+                fee = (self.entry_price + price) * position_size * TAKER_FEE
                 pnl = gross - fee
 
                 self.balance += pnl
                 self.realized_pnl += pnl
                 self.trades += 1
 
-                print(f"💰 EXIT SHORT @ {price:.2f} | PnL={pnl:.2f}")
+                print(f"💰 EXIT SHORT ({exit_reason}) @ {price:.2f} | PnL={pnl:.2f}")
                 self.log_trade("SHORT", price, pnl)
                 self.position = None
 
@@ -195,17 +227,11 @@ class MomentumFuturesPaperBot:
     # RUN LOOP
     # -------------------------
     def run(self):
-        print("🚀 Bot running (Always ON)\n")
-        last_kline_check = 0
+        print("🚀 Bot running (5m entry + tick risk)\n")
 
         while True:
             try:
-                now = time.time()
-
-                if now - last_kline_check >= KLINE_SLEEP:
-                    self.check_entry()
-                    last_kline_check = now
-
+                self.check_entry()
                 self.manage_risk()
 
                 print(
