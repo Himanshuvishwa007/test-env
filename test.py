@@ -3,6 +3,8 @@ import pandas as pd
 import time
 import csv
 from datetime import datetime
+import os
+import uuid
 
 # =============================
 # BINANCE FUTURES TESTNET
@@ -15,7 +17,7 @@ client = Client(API_KEY, API_SECRET, testnet=True)
 # =============================
 # CONFIG (FROZEN)
 # =============================
-SYMBOL = "ETHUSDT"
+SYMBOL = "ETHUSDT"              # HARD LOCKED
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 INITIAL_BALANCE = 10000.0
@@ -35,6 +37,11 @@ RSI_SHORT_MAX = 46
 
 KLINE_SLEEP = 300     # 5 min
 TICK_SLEEP = 10       # 10 sec
+
+# HARD SAFETY
+MIN_WARMUP_CANDLES = 120         # prevents early trades
+SESSION_ID = str(uuid.uuid4())[:8]
+LOG_FILE = f"trade_log_{SYMBOL}_{SESSION_ID}.csv"
 
 # =============================
 # INDICATORS
@@ -61,16 +68,20 @@ class MomentumFuturesPaperBot:
 
         self.realized_pnl = 0.0
         self.trades = 0
+        self.candle_count = 0
 
-        with open("trade_log_momentum_futures.csv", "w", newline="") as f:
+        # create fresh log
+        with open(LOG_FILE, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "Time", "Side", "EntryPrice", "ExitPrice",
+                "Time", "SessionID", "Symbol", "Side",
+                "EntryPrice", "ExitPrice",
                 "TradePnL", "NetPnL", "Equity"
             ])
 
         print("✅ Momentum Futures Paper Bot STARTED")
-        print("📌 ETHUSDT | 2× leverage | 5m entry + tick risk\n")
+        print(f"📌 {SYMBOL} | 2× leverage | session={SESSION_ID}")
+        print("🧊 Warm-up enforced | 5m entry + tick risk\n")
 
     # -------------------------
     # DATA
@@ -79,7 +90,7 @@ class MomentumFuturesPaperBot:
         klines = client.get_klines(
             symbol=SYMBOL,
             interval=INTERVAL,
-            limit=EMA_TREND + RSI_PERIOD + VOL_WINDOW + 10
+            limit=MIN_WARMUP_CANDLES + 10
         )
 
         df = pd.DataFrame(klines, columns=[
@@ -88,9 +99,9 @@ class MomentumFuturesPaperBot:
         ])
 
         df["time"] = pd.to_datetime(df["time"], unit="ms")
-        df[["open","high","low","close","volume"]] = df[
-            ["open","high","low","close","volume"]
-        ].astype(float)
+        df[["open","high","low","close","volume"]] = df[[
+            "open","high","low","close","volume"
+        ]].astype(float)
 
         return df[["time","open","high","low","close","volume"]]
 
@@ -103,10 +114,11 @@ class MomentumFuturesPaperBot:
     def log_trade(self, side, exit_price, trade_pnl):
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        with open("trade_log_momentum_futures.csv", "a", newline="") as f:
+        with open(LOG_FILE, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                now, side, self.entry_price, exit_price,
+                now, SESSION_ID, SYMBOL, side,
+                self.entry_price, exit_price,
                 trade_pnl, self.realized_pnl, self.balance
             ])
 
@@ -115,9 +127,10 @@ class MomentumFuturesPaperBot:
     # -------------------------
     def check_entry(self):
         df = self.fetch_klines()
+        self.candle_count = len(df)
 
-        # warm-up protection
-        if len(df) < max(EMA_TREND, RSI_PERIOD, VOL_WINDOW) + 2:
+        if self.candle_count < MIN_WARMUP_CANDLES:
+            print(f"⏳ Warming up candles: {self.candle_count}/{MIN_WARMUP_CANDLES}")
             return
 
         df["EMA"] = df["close"].ewm(span=EMA_TREND, adjust=False).mean()
@@ -160,8 +173,6 @@ class MomentumFuturesPaperBot:
             return
 
         price = self.fetch_tick_price()
-
-        # realistic futures sizing
         position_size = (self.balance * LEVERAGE) / self.entry_price
 
         if self.position == "LONG":
@@ -216,7 +227,7 @@ class MomentumFuturesPaperBot:
                 self.manage_risk()
 
                 print(
-                    f"[Tick] Pos={self.position} | Balance={self.balance:.2f} "
+                    f"[Tick] Pos={self.position} | Bal={self.balance:.2f} "
                     f"| NetPnL={self.realized_pnl:.2f} | Trades={self.trades}"
                 )
 
