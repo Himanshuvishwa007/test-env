@@ -107,7 +107,9 @@ class MomentumFuturesPaperBot:
     # -------------------------
     def check_entry(self):
         df = self.fetch_klines().dropna()
-        if len(df) < 100 or self.position:
+
+        # hard guardrail – prevents early / unstable entries
+        if len(df) < 120 or self.position:
             return
 
         df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
@@ -117,11 +119,20 @@ class MomentumFuturesPaperBot:
         last = df.iloc[-1]
         price = last["close"]
 
-        if price > last["EMA"] and last["RSI"] > RSI_LONG_MIN and last["volume"] > last["VOL_SMA"] * VOL_MULT:
+        if (
+            price > last["EMA"]
+            and last["RSI"] > RSI_LONG_MIN
+            and last["volume"] > last["VOL_SMA"] * VOL_MULT
+        ):
             self.open_position("LONG", price)
 
-        elif price < last["EMA"] and last["RSI"] < RSI_SHORT_MAX and last["volume"] > last["VOL_SMA"] * VOL_MULT:
+        elif (
+            price < last["EMA"]
+            and last["RSI"] < RSI_SHORT_MAX
+            and last["volume"] > last["VOL_SMA"] * VOL_MULT
+        ):
             self.open_position("SHORT", price)
+
 
     def open_position(self, side, price):
         self.position = side
