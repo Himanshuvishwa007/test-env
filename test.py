@@ -17,15 +17,17 @@ INITIAL_BALANCE = 10000.0
 LEVERAGE = 2
 
 # ---- PRODUCTION RISK ----
-RISK_PER_TRADE = 0.01        # 1% equity risk
+RISK_PER_TRADE = 0.01        # 1% risk
 MAX_DAILY_LOSS = 0.03        # 3% daily loss
-MAX_DRAWDOWN = 0.20          # 20% max equity drawdown
+MAX_DRAWDOWN = 0.20          # 20% drawdown kill switch
 
 TP_PCT = 0.008
 SL_PCT = 0.004
 MAKER_FEE = 0.0005
 
 EMA_TREND = 50
+EMA_SLOPE_LOOKBACK = 3
+
 RSI_PERIOD = 14
 VOL_WINDOW = 20
 VOL_MULT = 1.3
@@ -33,13 +35,17 @@ VOL_MULT = 1.3
 RSI_LONG_MIN = 54
 RSI_SHORT_MAX = 46
 
-KLINE_SLEEP = 300
-TICK_SLEEP = 10
+# ---- MODE SWITCH ----
+ENABLE_LONGS = False     # 🔴 disabled for testing
+ENABLE_SHORTS = True
+
+KLINE_SLEEP = 300        # 5 min
+TICK_SLEEP = 10          # tick risk checks
 
 # =============================
-# CLIENT
+# CLIENT (TESTNET / PAPER)
 # =============================
-client = Client("API_KEY", "API_SECRET", testnet=True)
+client = Client(API_KEY, API_SECRET, testnet=True)
 
 # =============================
 # INDICATORS
@@ -72,12 +78,11 @@ class MomentumFuturesPaperBot:
 
         with open(self.logfile, "w", newline="") as f:
             csv.writer(f).writerow([
-                "Time","Symbol","Side","Entry","Exit",
-                "PnL","Equity"
+                "Time","Symbol","Side","Entry","Exit","PnL","Equity"
             ])
 
-        print("✅ PRODUCTION-GRADE BOT STARTED")
-        print("📌 ETHUSDT | Fixed risk | Kill-switch enabled\n")
+        print("✅ Momentum Futures Paper Bot STARTED")
+        print("📌 ETHUSDT | SHORT-only | EMA slope + risk guardrails\n")
 
     # -------------------------
     # DATA
@@ -89,7 +94,10 @@ class MomentumFuturesPaperBot:
                 interval=INTERVAL,
                 limit=120
             ),
-            columns=["time","open","high","low","close","volume","_","_","_","_","_","_"]
+            columns=[
+                "time","open","high","low","close","volume",
+                "_","_","_","_","_","_"
+            ]
         )
 
         df["time"] = pd.to_datetime(df["time"], unit="ms")
@@ -103,44 +111,54 @@ class MomentumFuturesPaperBot:
         return float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
 
     # -------------------------
-    # ENTRY
+    # ENTRY (5m candles)
     # -------------------------
     def check_entry(self):
         df = self.fetch_klines().dropna()
 
-        # hard guardrail – prevents early / unstable entries
+        # hard guardrail
         if len(df) < 120 or self.position:
             return
 
         df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
+        df["EMA_SLOPE"] = df["EMA"] - df["EMA"].shift(EMA_SLOPE_LOOKBACK)
         df["RSI"] = rsi(df["close"], RSI_PERIOD)
         df["VOL_SMA"] = df["volume"].rolling(VOL_WINDOW).mean()
+
+        df = df.dropna()
+        if df.empty:
+            return
 
         last = df.iloc[-1]
         price = last["close"]
 
+        # -------- SHORT ONLY (FILTERED) --------
         if (
-            price > last["EMA"]
-            and last["RSI"] > RSI_LONG_MIN
-            and last["volume"] > last["VOL_SMA"] * VOL_MULT
-        ):
-            self.open_position("LONG", price)
-
-        elif (
-            price < last["EMA"]
+            ENABLE_SHORTS
+            and price < last["EMA"]
+            and last["EMA_SLOPE"] < 0
             and last["RSI"] < RSI_SHORT_MAX
             and last["volume"] > last["VOL_SMA"] * VOL_MULT
         ):
             self.open_position("SHORT", price)
 
+        # -------- LONG (DISABLED) --------
+        elif (
+            ENABLE_LONGS
+            and price > last["EMA"]
+            and last["EMA_SLOPE"] > 0
+            and last["RSI"] > RSI_LONG_MIN
+            and last["volume"] > last["VOL_SMA"] * VOL_MULT
+        ):
+            self.open_position("LONG", price)
 
     def open_position(self, side, price):
         self.position = side
         self.entry_price = price
-        print(f"📈 {side} @ {price:.2f}")
+        print(f"📉 {side} @ {price:.2f}")
 
     # -------------------------
-    # RISK MANAGEMENT
+    # RISK MANAGEMENT (tick)
     # -------------------------
     def manage_risk(self):
         if not self.position:
@@ -169,13 +187,17 @@ class MomentumFuturesPaperBot:
 
         with open(self.logfile, "a", newline="") as f:
             csv.writer(f).writerow([
-                datetime.utcnow(), SYMBOL, self.position,
-                self.entry_price, price, pnl, self.balance
+                datetime.utcnow(),
+                SYMBOL,
+                self.position,
+                self.entry_price,
+                price,
+                pnl,
+                self.balance
             ])
 
         print(f"💰 EXIT {self.position} | PnL={pnl:.2f}")
         self.position = None
-
         self.check_kill_switch()
 
     # -------------------------
@@ -192,12 +214,15 @@ class MomentumFuturesPaperBot:
             raise SystemExit("🛑 DAILY LOSS LIMIT HIT")
 
     # -------------------------
-    # RUN
+    # RUN LOOP
     # -------------------------
     def run(self):
+        print("🚀 Bot running (5m entry + tick risk)\n")
         last_kline = 0
+
         while True:
             now = time.time()
+
             if now - last_kline >= KLINE_SLEEP:
                 self.check_entry()
                 last_kline = now
