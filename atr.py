@@ -28,7 +28,8 @@ EMA_SLOW = 200
 ATR_PERIOD = 14
 BREAKOUT_LOOKBACK = 20
 
-RR_RATIO = 2.0     # Reward : Risk
+RR_RATIO = 2.0
+RISK_PER_TRADE = 0.01   # 1% risk per trade
 
 KLINE_SLEEP = 300
 TICK_SLEEP = 10
@@ -50,12 +51,12 @@ def atr(df, period):
 class ATRBreakoutPaperBot:
 
     def __init__(self):
-        self.balance = INITIAL_BALANCE
         self.position = None
         self.entry_price = None
         self.entry_time = None
         self.sl = None
         self.tp = None
+        self.qty = 0.0
 
         self.realized_pnl = 0.0
         self.trades = 0
@@ -64,11 +65,11 @@ class ATRBreakoutPaperBot:
             writer = csv.writer(f)
             writer.writerow([
                 "Time","Side","Entry","Exit",
-                "PnL","NetPnL","Equity"
+                "Qty","PnL","NetPnL","Equity"
             ])
 
         print("✅ ATR BREAKOUT PAPER BOT STARTED")
-        print("📌 Strategy frozen | Trend + ATR breakout\n")
+        print("📌 Proper risk management | 1% risk per trade\n")
 
     # -------------------------
     # DATA
@@ -96,6 +97,19 @@ class ATRBreakoutPaperBot:
         return float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
 
     # -------------------------
+    # POSITION SIZE
+    # -------------------------
+    def calculate_qty(self, entry, sl, equity):
+        risk_amount = equity * RISK_PER_TRADE
+        stop_distance = abs(entry - sl)
+
+        if stop_distance <= 0:
+            return 0
+
+        qty = risk_amount / (stop_distance * LEVERAGE)
+        return round(qty, 6)
+
+    # -------------------------
     # LOGGING
     # -------------------------
     def log_trade(self, side, exit_price, pnl):
@@ -107,7 +121,8 @@ class ATRBreakoutPaperBot:
             writer.writerow([
                 now, side,
                 self.entry_price, exit_price,
-                pnl, self.realized_pnl, equity
+                self.qty, pnl,
+                self.realized_pnl, equity
             ])
 
     # -------------------------
@@ -130,6 +145,7 @@ class ATRBreakoutPaperBot:
         low_range = df["low"].iloc[-BREAKOUT_LOOKBACK-2:-2].min()
 
         price = last["close"]
+        equity = INITIAL_BALANCE + self.realized_pnl
 
         # ===== LONG =====
         if (
@@ -137,13 +153,20 @@ class ATRBreakoutPaperBot:
             price > high_range and
             last["ATR"] > prev["ATR"]
         ):
+            sl = price - last["ATR"]
+            qty = self.calculate_qty(price, sl, equity)
+
+            if qty <= 0:
+                return
+
             self.position = "LONG"
             self.entry_price = price
             self.entry_time = last["time"]
-            self.sl = price - last["ATR"]
+            self.sl = sl
             self.tp = price + RR_RATIO * last["ATR"]
+            self.qty = qty
 
-            print(f"📈 LONG @ {price:.2f}")
+            print(f"📈 LONG @ {price:.2f} | QTY={qty}")
 
         # ===== SHORT =====
         elif (
@@ -151,13 +174,20 @@ class ATRBreakoutPaperBot:
             price < low_range and
             last["ATR"] > prev["ATR"]
         ):
+            sl = price + last["ATR"]
+            qty = self.calculate_qty(price, sl, equity)
+
+            if qty <= 0:
+                return
+
             self.position = "SHORT"
             self.entry_price = price
             self.entry_time = last["time"]
-            self.sl = price + last["ATR"]
+            self.sl = sl
             self.tp = price - RR_RATIO * last["ATR"]
+            self.qty = qty
 
-            print(f"📉 SHORT @ {price:.2f}")
+            print(f"📉 SHORT @ {price:.2f} | QTY={qty}")
 
     # -------------------------
     # RISK MGMT (tick)
@@ -168,9 +198,10 @@ class ATRBreakoutPaperBot:
 
         price = self.fetch_tick_price()
 
+        # ===== LONG EXIT =====
         if self.position == "LONG" and (price <= self.sl or price >= self.tp):
-            gross = (price - self.entry_price) * LEVERAGE
-            fee = (price + self.entry_price) * LEVERAGE * MAKER_FEE
+            gross = (price - self.entry_price) * self.qty * LEVERAGE
+            fee = (price + self.entry_price) * self.qty * MAKER_FEE
             pnl = gross - fee
 
             self.realized_pnl += pnl
@@ -180,9 +211,10 @@ class ATRBreakoutPaperBot:
             self.log_trade("LONG", price, pnl)
             self.position = None
 
+        # ===== SHORT EXIT =====
         elif self.position == "SHORT" and (price >= self.sl or price <= self.tp):
-            gross = (self.entry_price - price) * LEVERAGE
-            fee = (price + self.entry_price) * LEVERAGE * MAKER_FEE
+            gross = (self.entry_price - price) * self.qty * LEVERAGE
+            fee = (price + self.entry_price) * self.qty * MAKER_FEE
             pnl = gross - fee
 
             self.realized_pnl += pnl
@@ -212,7 +244,7 @@ class ATRBreakoutPaperBot:
                 equity = INITIAL_BALANCE + self.realized_pnl
                 print(
                     f"[Tick] Pos={self.position} | "
-                    f"PnL={self.realized_pnl:.2f} | "
+                    f"NetPnL={self.realized_pnl:.2f} | "
                     f"Equity={equity:.2f} | "
                     f"Trades={self.trades}"
                 )
