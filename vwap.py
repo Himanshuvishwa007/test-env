@@ -19,7 +19,7 @@ RISK_PER_TRADE = 0.01
 TP_MULT = 1.5
 SL_MULT = 1.0
 
-EMA_TREND = 200
+EMA_TREND = 100   # 🔥 faster than 200
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 VWAP_WINDOW = 288
@@ -27,9 +27,6 @@ VWAP_WINDOW = 288
 TICK_SLEEP = 10
 KLINE_SLEEP = 300
 
-# =============================
-# CLIENT
-# =============================
 client = Client(API_KEY, API_SECRET, testnet=True)
 
 # =============================
@@ -48,7 +45,6 @@ def atr(df, period):
         (df["high"] - df["close"].shift()).abs(),
         (df["low"] - df["close"].shift()).abs()
     ], axis=1).max(axis=1)
-
     return tr.rolling(period).mean()
 
 def vwap(df):
@@ -62,12 +58,12 @@ def vwap(df):
 class VWAPMeanReversionBot:
 
     def __init__(self):
-
         self.balance = INITIAL_BALANCE
         self.position = None
         self.entry_price = None
         self.sl = None
         self.tp = None
+        self.position_size = None  # ✅ FIXED
 
         self.logfile = f"trade_log_{SYMBOL}.csv"
 
@@ -79,10 +75,7 @@ class VWAPMeanReversionBot:
         print("✅ VWAP Mean Reversion Paper Bot Started")
 
     # -------------------------
-    # DATA
-    # -------------------------
     def fetch_klines(self):
-
         df = pd.DataFrame(
             client.get_klines(
                 symbol=SYMBOL,
@@ -107,46 +100,46 @@ class VWAPMeanReversionBot:
         return float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
 
     # -------------------------
-    # ENTRY
-    # -------------------------
     def check_entry(self):
 
         df = self.fetch_klines()
 
-        df["EMA200"] = df["close"].ewm(span=EMA_TREND).mean()
+        df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
         df["RSI"] = rsi(df["close"], RSI_PERIOD)
         df["ATR"] = atr(df, ATR_PERIOD)
         df["VWAP"] = vwap(df)
 
         df = df.dropna()
-
         last = df.iloc[-1]
 
         price = last["close"]
 
+        # 🔍 DEBUG (very important)
+        print(f"Price={price:.2f}, EMA={last['EMA']:.2f}, VWAP={last['VWAP']:.2f}, RSI={last['RSI']:.2f}")
+
         if self.position:
             return
 
+        # =====================
+        # IMPROVED CONDITIONS
+        # =====================
+
         # LONG
         if (
-            price > last["EMA200"]
-            and price < last["VWAP"]
-            and last["RSI"] < 35
+            price > last["EMA"]
+            and price < last["VWAP"] * 1.002   # 🔥 tolerance
+            and last["RSI"] < 45
         ):
-
             self.open_trade("LONG", price, last["ATR"])
 
         # SHORT
         elif (
-            price < last["EMA200"]
-            and price > last["VWAP"]
-            and last["RSI"] > 65
+            price < last["EMA"]
+            and price > last["VWAP"] * 0.998
+            and last["RSI"] > 55
         ):
-
             self.open_trade("SHORT", price, last["ATR"])
 
-    # -------------------------
-    # OPEN
     # -------------------------
     def open_trade(self, side, price, atr_value):
 
@@ -160,10 +153,12 @@ class VWAPMeanReversionBot:
             self.sl = price + atr_value * SL_MULT
             self.tp = price - atr_value * TP_MULT
 
+        # ✅ FIX: position size locked here
+        risk_amount = self.balance * RISK_PER_TRADE
+        self.position_size = risk_amount / abs(price - self.sl)
+
         print(f"📈 {side} ENTRY @ {price:.2f}")
 
-    # -------------------------
-    # MANAGE POSITION
     # -------------------------
     def manage_trade(self):
 
@@ -172,32 +167,22 @@ class VWAPMeanReversionBot:
 
         price = self.fetch_price()
 
-        risk_amount = self.balance * RISK_PER_TRADE
-        position_size = risk_amount / abs(self.entry_price - self.sl)
-
         if self.position == "LONG":
-
             if price >= self.tp or price <= self.sl:
-
-                pnl = (price - self.entry_price) * position_size
+                pnl = (price - self.entry_price) * self.position_size
                 self.close_trade(price, pnl)
 
         else:
-
             if price <= self.tp or price >= self.sl:
-
-                pnl = (self.entry_price - price) * position_size
+                pnl = (self.entry_price - price) * self.position_size
                 self.close_trade(price, pnl)
 
-    # -------------------------
-    # CLOSE
     # -------------------------
     def close_trade(self, price, pnl):
 
         self.balance += pnl
 
         with open(self.logfile, "a", newline="") as f:
-
             csv.writer(f).writerow([
                 datetime.utcnow(),
                 SYMBOL,
@@ -213,12 +198,9 @@ class VWAPMeanReversionBot:
         self.position = None
 
     # -------------------------
-    # RUN LOOP
-    # -------------------------
     def run(self):
 
         print("🚀 Bot running...")
-
         last_kline = 0
 
         while True:
@@ -226,16 +208,12 @@ class VWAPMeanReversionBot:
             now = time.time()
 
             if now - last_kline >= KLINE_SLEEP:
-
                 self.check_entry()
                 last_kline = now
 
             self.manage_trade()
-
             time.sleep(TICK_SLEEP)
 
 
-# =============================
-# START
 # =============================
 VWAPMeanReversionBot().run()
