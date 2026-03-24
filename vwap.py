@@ -14,12 +14,15 @@ SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 INITIAL_BALANCE = 10000
-RISK_PER_TRADE = 0.01
+
+# Futures settings
+LEVERAGE = 2
+FEE_RATE = 0.0004   # 0.04% per side
 
 TP_MULT = 1.5
 SL_MULT = 1.0
 
-EMA_TREND = 100   # 🔥 faster than 200
+EMA_TREND = 200
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 VWAP_WINDOW = 288
@@ -55,7 +58,7 @@ def vwap(df):
 # =============================
 # BOT
 # =============================
-class VWAPMeanReversionBot:
+class FuturesVWAPBot:
 
     def __init__(self):
         self.balance = INITIAL_BALANCE
@@ -63,16 +66,16 @@ class VWAPMeanReversionBot:
         self.entry_price = None
         self.sl = None
         self.tp = None
-        self.position_size = None  # ✅ FIXED
+        self.position_size = None
 
         self.logfile = f"trade_log_{SYMBOL}.csv"
 
         with open(self.logfile, "w", newline="") as f:
             csv.writer(f).writerow(
-                ["Time","Symbol","Side","Entry","Exit","PnL","Equity"]
+                ["Time","Symbol","Side","Entry","Exit","PnL","Fee","Balance"]
             )
 
-        print("✅ VWAP Mean Reversion Paper Bot Started")
+        print("✅ Futures 2x VWAP Bot Started")
 
     # -------------------------
     def fetch_klines(self):
@@ -114,20 +117,15 @@ class VWAPMeanReversionBot:
 
         price = last["close"]
 
-        # 🔍 DEBUG (very important)
         print(f"Price={price:.2f}, EMA={last['EMA']:.2f}, VWAP={last['VWAP']:.2f}, RSI={last['RSI']:.2f}")
 
         if self.position:
             return
 
-        # =====================
-        # IMPROVED CONDITIONS
-        # =====================
-
         # LONG
         if (
             price > last["EMA"]
-            and price < last["VWAP"] * 1.002   # 🔥 tolerance
+            and price < last["VWAP"] * 1.002
             and last["RSI"] < 45
         ):
             self.open_trade("LONG", price, last["ATR"])
@@ -153,11 +151,12 @@ class VWAPMeanReversionBot:
             self.sl = price + atr_value * SL_MULT
             self.tp = price - atr_value * TP_MULT
 
-        # ✅ FIX: position size locked here
-        risk_amount = self.balance * RISK_PER_TRADE
-        self.position_size = risk_amount / abs(price - self.sl)
+        # Futures position sizing
+        position_value = self.balance * LEVERAGE
+        self.position_size = position_value / price
 
         print(f"📈 {side} ENTRY @ {price:.2f}")
+        print(f"⚡ Position Value: {position_value:.2f} | Size: {self.position_size:.4f}")
 
     # -------------------------
     def manage_trade(self):
@@ -180,6 +179,12 @@ class VWAPMeanReversionBot:
     # -------------------------
     def close_trade(self, price, pnl):
 
+        entry_value = self.position_size * self.entry_price
+        exit_value = self.position_size * price
+
+        fee = (entry_value + exit_value) * FEE_RATE
+        pnl = pnl - fee
+
         self.balance += pnl
 
         with open(self.logfile, "a", newline="") as f:
@@ -190,10 +195,11 @@ class VWAPMeanReversionBot:
                 self.entry_price,
                 price,
                 pnl,
+                fee,
                 self.balance
             ])
 
-        print(f"💰 EXIT {self.position} | PnL = {pnl:.2f} | Balance = {self.balance:.2f}")
+        print(f"💰 EXIT {self.position} | PnL={pnl:.2f} | Fee={fee:.2f} | Balance={self.balance:.2f}")
 
         self.position = None
 
@@ -216,4 +222,4 @@ class VWAPMeanReversionBot:
 
 
 # =============================
-VWAPMeanReversionBot().run()
+FuturesVWAPBot().run()
