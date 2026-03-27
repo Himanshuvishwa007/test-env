@@ -72,7 +72,7 @@ class FuturesVWAPBot:
 
         with open(self.logfile, "w", newline="") as f:
             csv.writer(f).writerow(
-                ["Time","Symbol","Side","Entry","Exit","PnL","Fee","Balance"]
+                ["Time","Symbol","Side","Entry","Exit","GrossPnL","Fee","NetPnL","Balance"]
             )
 
         print("✅ Futures 2x VWAP Bot Started")
@@ -105,6 +105,9 @@ class FuturesVWAPBot:
     # -------------------------
     def check_entry(self):
 
+        if self.position:
+            return
+
         df = self.fetch_klines()
 
         df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
@@ -118,9 +121,6 @@ class FuturesVWAPBot:
         price = last["close"]
 
         print(f"Price={price:.2f}, EMA={last['EMA']:.2f}, VWAP={last['VWAP']:.2f}, RSI={last['RSI']:.2f}")
-
-        if self.position:
-            return
 
         # LONG
         if (
@@ -151,12 +151,12 @@ class FuturesVWAPBot:
             self.sl = price + atr_value * SL_MULT
             self.tp = price - atr_value * TP_MULT
 
-        # Futures position sizing
         position_value = self.balance * LEVERAGE
         self.position_size = position_value / price
 
         print(f"📈 {side} ENTRY @ {price:.2f}")
         print(f"⚡ Position Value: {position_value:.2f} | Size: {self.position_size:.4f}")
+        print(f"🎯 TP={self.tp:.2f} | 🛑 SL={self.sl:.2f}")
 
     # -------------------------
     def manage_trade(self):
@@ -179,14 +179,22 @@ class FuturesVWAPBot:
     # -------------------------
     def close_trade(self, price, pnl):
 
+        # --- Values ---
         entry_value = self.position_size * self.entry_price
         exit_value = self.position_size * price
 
+        # --- Fee ---
         fee = (entry_value + exit_value) * FEE_RATE
-        pnl = pnl - fee
 
-        self.balance += pnl
+        # --- PnL ---
+        gross_pnl = pnl
+        net_pnl = gross_pnl - fee
 
+        # --- Update balance ---
+        prev_balance = self.balance
+        self.balance += net_pnl
+
+        # --- Log ---
         with open(self.logfile, "a", newline="") as f:
             csv.writer(f).writerow([
                 datetime.utcnow(),
@@ -194,12 +202,20 @@ class FuturesVWAPBot:
                 self.position,
                 self.entry_price,
                 price,
-                pnl,
+                gross_pnl,
                 fee,
+                net_pnl,
                 self.balance
             ])
 
-        print(f"💰 EXIT {self.position} | PnL={pnl:.2f} | Fee={fee:.2f} | Balance={self.balance:.2f}")
+        print("\n💰 TRADE CLOSED")
+        print(f"Side        : {self.position}")
+        print(f"Entry       : {self.entry_price:.2f}")
+        print(f"Exit        : {price:.2f}")
+        print(f"Gross PnL   : {gross_pnl:.2f}")
+        print(f"Fee         : {fee:.2f}")
+        print(f"Net PnL     : {net_pnl:.2f}")
+        print(f"Balance     : {prev_balance:.2f} → {self.balance:.2f}\n")
 
         self.position = None
 
