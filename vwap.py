@@ -1,4 +1,5 @@
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 import pandas as pd
 import time
 import csv
@@ -15,9 +16,8 @@ INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 INITIAL_BALANCE = 10000
 
-# Futures settings
 LEVERAGE = 2
-FEE_RATE = 0.0004   # 0.04% per side
+FEE_RATE = 0.0004
 
 TP_MULT = 1.5
 SL_MULT = 1.0
@@ -30,7 +30,29 @@ VWAP_WINDOW = 288
 TICK_SLEEP = 10
 KLINE_SLEEP = 300
 
+MAX_RETRIES = 5
+
 client = Client(API_KEY, API_SECRET, testnet=True)
+
+# =============================
+# SAFE API WRAPPER
+# =============================
+def safe_api_call(func):
+    for i in range(MAX_RETRIES):
+        try:
+            return func()
+        except BinanceAPIException as e:
+            if "502" in str(e):
+                print(f"⚠️ 502 Error, retry {i+1}")
+                time.sleep(2 ** i)
+            else:
+                print(f"❌ API Error: {e}")
+                return None
+        except Exception as e:
+            print(f"❌ Network Error: {e}")
+            time.sleep(2 ** i)
+
+    return None
 
 # =============================
 # INDICATORS
@@ -75,32 +97,41 @@ class FuturesVWAPBot:
                 ["Time","Symbol","Side","Entry","Exit","GrossPnL","Fee","NetPnL","Balance"]
             )
 
-        print("✅ Futures 2x VWAP Bot Started")
+        print("✅ Futures VWAP Bot Started")
 
     # -------------------------
     def fetch_klines(self):
-        df = pd.DataFrame(
-            client.get_klines(
-                symbol=SYMBOL,
-                interval=INTERVAL,
-                limit=1000
-            ),
-            columns=[
-                "time","open","high","low","close","volume",
-                "_","_","_","_","_","_"
-            ]
-        )
+
+        data = safe_api_call(lambda: client.get_klines(
+            symbol=SYMBOL,
+            interval=INTERVAL,
+            limit=1000
+        ))
+
+        if not data:
+            return None
+
+        df = pd.DataFrame(data, columns=[
+            "time","open","high","low","close","volume",
+            "_","_","_","_","_","_"
+        ])
 
         df["time"] = pd.to_datetime(df["time"], unit="ms")
-
         df[["open","high","low","close","volume"]] = df[
             ["open","high","low","close","volume"]
         ].astype(float)
 
         return df
 
+    # -------------------------
     def fetch_price(self):
-        return float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
+
+        data = safe_api_call(lambda: client.get_symbol_ticker(symbol=SYMBOL))
+
+        if not data:
+            return None
+
+        return float(data["price"])
 
     # -------------------------
     def check_entry(self):
@@ -110,36 +141,40 @@ class FuturesVWAPBot:
 
         df = self.fetch_klines()
 
+        if df is None or df.empty:
+            print("⚠️ No data, skipping entry")
+            return
+
         df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
         df["RSI"] = rsi(df["close"], RSI_PERIOD)
         df["ATR"] = atr(df, ATR_PERIOD)
         df["VWAP"] = vwap(df)
 
         df = df.dropna()
-        last = df.iloc[-1]
 
+        if df.empty:
+            print("⚠️ Not enough data after indicators")
+            return
+
+        last = df.iloc[-1]
         price = last["close"]
 
         print(f"Price={price:.2f}, EMA={last['EMA']:.2f}, VWAP={last['VWAP']:.2f}, RSI={last['RSI']:.2f}")
 
         # LONG
-        if (
-            price > last["EMA"]
-            and price < last["VWAP"] * 1.002
-            and last["RSI"] < 45
-        ):
+        if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
             self.open_trade("LONG", price, last["ATR"])
 
         # SHORT
-        elif (
-            price < last["EMA"]
-            and price > last["VWAP"] * 0.998
-            and last["RSI"] > 55
-        ):
+        elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
             self.open_trade("SHORT", price, last["ATR"])
 
     # -------------------------
     def open_trade(self, side, price, atr_value):
+
+        if atr_value is None or atr_value == 0:
+            print("⚠️ Invalid ATR")
+            return
 
         self.position = side
         self.entry_price = price
@@ -155,7 +190,6 @@ class FuturesVWAPBot:
         self.position_size = position_value / price
 
         print(f"📈 {side} ENTRY @ {price:.2f}")
-        print(f"⚡ Position Value: {position_value:.2f} | Size: {self.position_size:.4f}")
         print(f"🎯 TP={self.tp:.2f} | 🛑 SL={self.sl:.2f}")
 
     # -------------------------
@@ -166,35 +200,45 @@ class FuturesVWAPBot:
 
         price = self.fetch_price()
 
+        if price is None:
+            print("⚠️ Price fetch failed")
+            return
+
+        # STOP LOSS & TAKE PROFIT CHECK
         if self.position == "LONG":
-            if price >= self.tp or price <= self.sl:
+            if price <= self.sl:
+                print("🛑 STOP LOSS HIT")
                 pnl = (price - self.entry_price) * self.position_size
                 self.close_trade(price, pnl)
 
-        else:
-            if price <= self.tp or price >= self.sl:
+            elif price >= self.tp:
+                print("🎯 TAKE PROFIT HIT")
+                pnl = (price - self.entry_price) * self.position_size
+                self.close_trade(price, pnl)
+
+        elif self.position == "SHORT":
+            if price >= self.sl:
+                print("🛑 STOP LOSS HIT")
+                pnl = (self.entry_price - price) * self.position_size
+                self.close_trade(price, pnl)
+
+            elif price <= self.tp:
+                print("🎯 TAKE PROFIT HIT")
                 pnl = (self.entry_price - price) * self.position_size
                 self.close_trade(price, pnl)
 
     # -------------------------
     def close_trade(self, price, pnl):
 
-        # --- Values ---
         entry_value = self.position_size * self.entry_price
         exit_value = self.position_size * price
 
-        # --- Fee ---
         fee = (entry_value + exit_value) * FEE_RATE
 
-        # --- PnL ---
-        gross_pnl = pnl
-        net_pnl = gross_pnl - fee
-
-        # --- Update balance ---
+        net_pnl = pnl - fee
         prev_balance = self.balance
         self.balance += net_pnl
 
-        # --- Log ---
         with open(self.logfile, "a", newline="") as f:
             csv.writer(f).writerow([
                 datetime.utcnow(),
@@ -202,20 +246,14 @@ class FuturesVWAPBot:
                 self.position,
                 self.entry_price,
                 price,
-                gross_pnl,
+                pnl,
                 fee,
                 net_pnl,
                 self.balance
             ])
 
         print("\n💰 TRADE CLOSED")
-        print(f"Side        : {self.position}")
-        print(f"Entry       : {self.entry_price:.2f}")
-        print(f"Exit        : {price:.2f}")
-        print(f"Gross PnL   : {gross_pnl:.2f}")
-        print(f"Fee         : {fee:.2f}")
-        print(f"Net PnL     : {net_pnl:.2f}")
-        print(f"Balance     : {prev_balance:.2f} → {self.balance:.2f}\n")
+        print(f"Balance: {prev_balance:.2f} → {self.balance:.2f}\n")
 
         self.position = None
 
@@ -226,16 +264,19 @@ class FuturesVWAPBot:
         last_kline = 0
 
         while True:
+            try:
+                now = time.time()
 
-            now = time.time()
+                if now - last_kline >= KLINE_SLEEP:
+                    self.check_entry()
+                    last_kline = now
 
-            if now - last_kline >= KLINE_SLEEP:
-                self.check_entry()
-                last_kline = now
+                self.manage_trade()
 
-            self.manage_trade()
+            except Exception as e:
+                print(f"🚨 ERROR: {e}")
+
             time.sleep(TICK_SLEEP)
-
 
 # =============================
 FuturesVWAPBot().run()
