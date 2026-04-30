@@ -3,6 +3,7 @@ import time
 import math
 import logging
 import pandas as pd
+from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from binance.client import Client
 from binance import ThreadedWebsocketManager
@@ -62,10 +63,11 @@ def safe_call(func):
     return None
 
 # =============================
-# PRECISION + FILTERS
+# GET SYMBOL FILTERS
 # =============================
-def get_symbol_filters():
+def get_filters():
     info = safe_call(lambda: client.futures_exchange_info())
+
     for s in info["symbols"]:
         if s["symbol"] == SYMBOL:
             filters = {f["filterType"]: f for f in s["filters"]}
@@ -79,27 +81,38 @@ def get_symbol_filters():
 
     return 0.001, 0.001, 0.1, 20
 
-STEP, MIN_QTY, TICK, MIN_NOTIONAL = get_symbol_filters()
+STEP, MIN_QTY, TICK, MIN_NOTIONAL = get_filters()
 
-def round_qty(q):
-    return math.floor(q / STEP) * STEP
+# =============================
+# PRECISION SAFE ROUNDING
+# =============================
+def round_qty(qty):
+    precision = int(round(-math.log10(STEP)))
+    qty = math.floor(qty / STEP) * STEP
 
-def round_price(p):
-    return round(p / TICK) * TICK
+    return float(
+        Decimal(str(qty)).quantize(
+            Decimal(str(STEP)),
+            rounding=ROUND_DOWN
+        )
+    )
 
-# ✅ NEW: Adjust qty to exchange rules
+def round_price(price):
+    return round(price / TICK) * TICK
+
+# =============================
+# QTY ADJUSTMENT (FIXED)
+# =============================
 def adjust_qty(qty, price):
-    # enforce min qty
     qty = max(qty, MIN_QTY)
 
-    # enforce min notional
+    # enforce notional
     if qty * price < MIN_NOTIONAL:
         qty = math.ceil((MIN_NOTIONAL / price) / STEP) * STEP
 
-    # round properly
     qty = round_qty(qty)
 
-    # final validation
+    # final safety check
     if qty * price < MIN_NOTIONAL:
         return None
 
@@ -126,10 +139,10 @@ def atr(df, period):
 def vwap(df):
     pv = (df["close"] * df["volume"]).rolling(VWAP_WINDOW).sum()
     vol = df["volume"].rolling(VWAP_WINDOW).sum()
-    return pv/vol
+    return pv / vol
 
 # =============================
-# BOT
+# BOT CLASS
 # =============================
 class Bot:
 
@@ -143,7 +156,10 @@ class Bot:
         self.sync_position()
 
     def set_leverage(self):
-        safe_call(lambda: client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE))
+        safe_call(lambda: client.futures_change_leverage(
+            symbol=SYMBOL,
+            leverage=LEVERAGE
+        ))
         log(f"Leverage set {LEVERAGE}x")
 
     def get_balance(self):
@@ -163,11 +179,13 @@ class Bot:
                 self.position = "LONG" if amt > 0 else "SHORT"
                 log(f"Synced: {self.position} {self.qty}")
 
-    def cancel_open_orders(self):
-        safe_call(lambda: client.futures_cancel_all_open_orders(symbol=SYMBOL))
-
     def fetch_klines(self):
-        data = safe_call(lambda: client.futures_klines(symbol=SYMBOL, interval="5m", limit=300))
+        data = safe_call(lambda: client.futures_klines(
+            symbol=SYMBOL,
+            interval="5m",
+            limit=300
+        ))
+
         if not data:
             return None
 
@@ -175,19 +193,19 @@ class Bot:
             "time","open","high","low","close","volume",
             "_","_","_","_","_","_"
         ])
+
         df[["open","high","low","close","volume"]] = df[
             ["open","high","low","close","volume"]
         ].astype(float)
 
         return df
 
-    # =========================
-    # FIXED TRADE LOGIC
-    # =========================
+    # =============================
+    # TRADE EXECUTION (FIXED)
+    # =============================
     def open_trade(self, side, price, atr_val):
 
         if self.position:
-            log("Already in position")
             return
 
         balance = self.get_balance()
@@ -201,16 +219,12 @@ class Bot:
 
         log(f"Final Qty: {qty}, Notional: {qty * price}")
 
-        if self.last_price and abs(price - self.last_price)/price > SLIPPAGE_THRESHOLD:
-            log("Slippage too high")
-            return
-
-        self.cancel_open_orders()
+        self.last_price = price
 
         try:
             order = safe_call(lambda: client.futures_create_order(
                 symbol=SYMBOL,
-                side="BUY" if side=="LONG" else "SELL",
+                side="BUY" if side == "LONG" else "SELL",
                 type="MARKET",
                 quantity=qty
             ))
@@ -242,7 +256,7 @@ class Bot:
 
         safe_call(lambda: client.futures_create_order(
             symbol=SYMBOL,
-            side="SELL" if side=="LONG" else "BUY",
+            side="SELL" if side == "LONG" else "BUY",
             type="STOP_MARKET",
             stopPrice=round_price(sl),
             closePosition=True
@@ -250,62 +264,37 @@ class Bot:
 
         safe_call(lambda: client.futures_create_order(
             symbol=SYMBOL,
-            side="SELL" if side=="LONG" else "BUY",
+            side="SELL" if side == "LONG" else "BUY",
             type="TAKE_PROFIT_MARKET",
             stopPrice=round_price(tp),
             closePosition=True
         ))
 
-    def check_entry(self):
-
-        if self.position:
-            return
-
-        df = self.fetch_klines()
-        if df is None:
-            return
-
-        df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
-        df["RSI"] = rsi(df["close"], RSI_PERIOD)
-        df["ATR"] = atr(df, ATR_PERIOD)
-        df["VWAP"] = vwap(df)
-
-        df = df.dropna()
-        last = df.iloc[-1]
-
-        price = last["close"]
-
-        if price > last["EMA"] and price < last["VWAP"]*1.002 and last["RSI"] < 45:
-            self.open_trade("LONG", price, last["ATR"])
-
-        elif price < last["EMA"] and price > last["VWAP"]*0.998 and last["RSI"] > 55:
-            self.open_trade("SHORT", price, last["ATR"])
-
-    def on_price(self, msg):
-        try:
-            self.last_price = float(msg["c"])
-        except:
-            pass
-
-    def start_ws(self):
-        while True:
-            try:
-                twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
-                twm.start()
-                twm.start_symbol_ticker_socket(callback=self.on_price, symbol=SYMBOL)
-                log("WebSocket started")
-                break
-            except Exception as e:
-                log(f"WS restart: {e}")
-                time.sleep(5)
-
     def run(self):
-
-        self.start_ws()
+        log("Bot started")
 
         while True:
             try:
-                self.check_entry()
+                df = self.fetch_klines()
+                if df is None:
+                    continue
+
+                df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
+                df["RSI"] = rsi(df["close"], RSI_PERIOD)
+                df["ATR"] = atr(df, ATR_PERIOD)
+                df["VWAP"] = vwap(df)
+
+                df = df.dropna()
+                last = df.iloc[-1]
+
+                price = last["close"]
+
+                if price > last["EMA"] and last["RSI"] < 45:
+                    self.open_trade("LONG", price, last["ATR"])
+
+                elif price < last["EMA"] and last["RSI"] > 55:
+                    self.open_trade("SHORT", price, last["ATR"])
+
             except Exception as e:
                 log(f"Loop error: {e}")
 
