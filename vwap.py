@@ -9,7 +9,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
 # =============================
-# CONFIG (UNCHANGED STRATEGY PARAMS)
+# CONFIG
 # =============================
 load_dotenv()
 
@@ -79,7 +79,7 @@ def round_qty(q):
     return float(Decimal(str(q)).quantize(Decimal(str(F["step"])), ROUND_DOWN))
 
 # =============================
-# INDICATORS (YOUR ORIGINAL)
+# INDICATORS
 # =============================
 def rsi(series, period):
     delta = series.diff()
@@ -125,7 +125,7 @@ def emergency_close(qty, side):
     ))
 
 # =============================
-# SL/TP (FIXED)
+# SL/TP (SAFE)
 # =============================
 def place_sl_tp(side, qty, sl, tp):
 
@@ -157,47 +157,52 @@ def place_sl_tp(side, qty, sl, tp):
     return sl_order and tp_order
 
 # =============================
-# MAIN LOGIC (YOUR STRATEGY RESTORED)
+# MAIN LOOP
 # =============================
 def run():
 
-    log("BOT STARTED (VWAP RESTORED)")
+    log("BOT STARTED (FINAL VERSION)")
 
     while True:
 
-        df = safe_call(lambda: client.futures_klines(
+        data = safe_call(lambda: client.futures_klines(
             symbol=SYMBOL,
             interval="5m",
             limit=300
         ))
 
-        if not df:
+        if not data:
             continue
 
-        df = pd.DataFrame(df, columns=[
-            "t","o","h","l","c","v",
+        # ✔ FIXED COLUMN NAMES
+        df = pd.DataFrame(data, columns=[
+            "time","open","high","low","close","volume",
             "_","_","_","_","_","_"
         ])
 
-        df[["o","h","l","c","v"]] = df[["o","h","l","c","v"]].astype(float)
+        df[["open","high","low","close","volume"]] = df[
+            ["open","high","low","close","volume"]
+        ].astype(float)
 
-        # ===== INDICATORS =====
-        df["EMA"] = df["c"].ewm(span=EMA_TREND).mean()
-        df["RSI"] = rsi(df["c"], RSI_PERIOD)
+        # INDICATORS
+        df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
+        df["RSI"] = rsi(df["close"], RSI_PERIOD)
         df["ATR"] = atr(df, ATR_PERIOD)
         df["VWAP"] = vwap(df)
 
         df = df.dropna()
         last = df.iloc[-1]
 
-        price = last["c"]
+        price = last["close"]
 
         if has_position():
             log("Position exists")
             time.sleep(SLEEP)
             continue
 
-        # ===== YOUR EXACT ENTRY LOGIC =====
+        # =============================
+        # YOUR ORIGINAL STRATEGY
+        # =============================
         if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
             side = "LONG"
 
@@ -208,7 +213,7 @@ def run():
             time.sleep(SLEEP)
             continue
 
-        # ===== QTY =====
+        # QTY
         balance = float(client.futures_account_balance()[0]["balance"])
         qty = round_qty((balance * LEVERAGE) / price)
 
@@ -217,7 +222,7 @@ def run():
             time.sleep(SLEEP)
             continue
 
-        # ===== ENTRY =====
+        # ENTRY
         order = safe_call(lambda: client.futures_create_order(
             symbol=SYMBOL,
             side="BUY" if side=="LONG" else "SELL",
@@ -231,7 +236,7 @@ def run():
         avg = float(order.get("avgPrice", 0)) or price
         log(f"{side} @ {avg}")
 
-        # ===== ATR SL/TP (UNCHANGED IDEA) =====
+        # ATR BASED SL/TP
         if side == "LONG":
             sl = avg - last["ATR"] * SL_MULT
             tp = avg + last["ATR"] * TP_MULT
@@ -239,7 +244,7 @@ def run():
             sl = avg + last["ATR"] * SL_MULT
             tp = avg - last["ATR"] * TP_MULT
 
-        # ===== PROTECTION =====
+        # PROTECTION
         if not place_sl_tp(side, qty, sl, tp):
             log("❌ SL/TP failed")
             emergency_close(qty, side)
