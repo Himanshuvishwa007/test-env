@@ -1,58 +1,82 @@
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
-import pandas as pd
+import os
 import time
-import csv
-from datetime import datetime
+import math
+import logging
+import pandas as pd
+from dotenv import load_dotenv
+from binance.client import Client
+from binance import ThreadedWebsocketManager
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 
 # =============================
 # CONFIG
 # =============================
-API_KEY = "YMkkDGSM5Euk3NsAt21WcRhFFvm70559lMh1hsD79tQ0ayqPnctslCpFuEMA5R2yD"
-API_SECRET = "oER1r73vKVvdWf5cJ0Hn7aOq4R1Pe3HAlciVgyur0TMZ9j0tqP5wUk1YwDLPazRD"
+load_dotenv()
+
+API_KEY = os.getenv("BINANCE_LIVE_API_KEY")
+API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 
 SYMBOL = "ETHUSDT"
-INTERVAL = Client.KLINE_INTERVAL_5MINUTE
-
-INITIAL_BALANCE = 10000
-
 LEVERAGE = 2
-FEE_RATE = 0.0004
-
-TP_MULT = 1.5
-SL_MULT = 1.0
 
 EMA_TREND = 200
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 VWAP_WINDOW = 288
 
-TICK_SLEEP = 10
-KLINE_SLEEP = 300
+TP_MULT = 1.5
+SL_MULT = 1.0
 
+SLEEP = 60
 MAX_RETRIES = 5
-
-client = Client(API_KEY, API_SECRET, testnet=True)
+SLIPPAGE_THRESHOLD = 0.002  # 0.2%
 
 # =============================
-# SAFE API WRAPPER
+# LOGGING
 # =============================
-def safe_api_call(func):
+logging.basicConfig(
+    filename="bot.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+def log(msg):
+    print(msg)
+    logging.info(msg)
+
+client = Client(API_KEY, API_SECRET)
+
+# =============================
+# SAFE CALL
+# =============================
+def safe_call(func):
     for i in range(MAX_RETRIES):
         try:
             return func()
-        except BinanceAPIException as e:
-            if "502" in str(e):
-                print(f"⚠️ 502 Error, retry {i+1}")
-                time.sleep(2 ** i)
-            else:
-                print(f"❌ API Error: {e}")
-                return None
-        except Exception as e:
-            print(f"❌ Network Error: {e}")
+        except (BinanceAPIException, BinanceRequestException) as e:
+            log(f"Retry {i+1}: {e}")
             time.sleep(2 ** i)
-
+        except Exception as e:
+            log(f"Unknown error {i+1}: {e}")
+            time.sleep(2 ** i)
     return None
+
+# =============================
+# PRECISION
+# =============================
+def get_precision():
+    info = safe_call(lambda: client.futures_exchange_info())
+    for s in info["symbols"]:
+        if s["symbol"] == SYMBOL:
+            step = float([f for f in s["filters"] if f["filterType"]=="LOT_SIZE"][0]["stepSize"])
+            tick = float([f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"][0]["tickSize"])
+            return step, tick
+    return 0.001, 0.1
+
+STEP, TICK = get_precision()
+
+def round_qty(q): return math.floor(q/STEP)*STEP
+def round_price(p): return round(p/TICK)*TICK
 
 # =============================
 # INDICATORS
@@ -62,7 +86,7 @@ def rsi(series, period):
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     rs = gain.rolling(period).mean() / loss.rolling(period).mean()
-    return 100 - (100 / (1 + rs))
+    return 100 - (100/(1+rs))
 
 def atr(df, period):
     tr = pd.concat([
@@ -75,39 +99,53 @@ def atr(df, period):
 def vwap(df):
     pv = (df["close"] * df["volume"]).rolling(VWAP_WINDOW).sum()
     vol = df["volume"].rolling(VWAP_WINDOW).sum()
-    return pv / vol
+    return pv/vol
 
 # =============================
 # BOT
 # =============================
-class FuturesVWAPBot:
+class Bot:
 
     def __init__(self):
-        self.balance = INITIAL_BALANCE
         self.position = None
-        self.entry_price = None
-        self.sl = None
-        self.tp = None
-        self.position_size = None
+        self.qty = 0
+        self.entry_price = 0
+        self.last_price = None
 
-        self.logfile = f"trade_log_{SYMBOL}.csv"
+        self.set_leverage()
+        self.sync_position()
 
-        with open(self.logfile, "w", newline="") as f:
-            csv.writer(f).writerow(
-                ["Time","Symbol","Side","Entry","Exit","GrossPnL","Fee","NetPnL","Balance"]
-            )
+    # -------------------------
+    def set_leverage(self):
+        safe_call(lambda: client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE))
+        log(f"Leverage set {LEVERAGE}x")
 
-        print("✅ Futures VWAP Bot Started")
+    # -------------------------
+    def get_balance(self):
+        data = safe_call(lambda: client.futures_account_balance())
+        for b in data:
+            if b["asset"] in ["USDT", "FDUSD"]:
+                return float(b["balance"])
+        return 0
+
+    # -------------------------
+    def sync_position(self):
+        pos = safe_call(lambda: client.futures_position_information(symbol=SYMBOL))
+        for p in pos:
+            amt = float(p["positionAmt"])
+            if amt != 0:
+                self.qty = abs(amt)
+                self.entry_price = float(p["entryPrice"])
+                self.position = "LONG" if amt > 0 else "SHORT"
+                log(f"Synced: {self.position} {self.qty}")
+
+    # -------------------------
+    def cancel_open_orders(self):
+        safe_call(lambda: client.futures_cancel_all_open_orders(symbol=SYMBOL))
 
     # -------------------------
     def fetch_klines(self):
-
-        data = safe_api_call(lambda: client.get_klines(
-            symbol=SYMBOL,
-            interval=INTERVAL,
-            limit=1000
-        ))
-
+        data = safe_call(lambda: client.futures_klines(symbol=SYMBOL, interval="5m", limit=300))
         if not data:
             return None
 
@@ -115,8 +153,6 @@ class FuturesVWAPBot:
             "time","open","high","low","close","volume",
             "_","_","_","_","_","_"
         ])
-
-        df["time"] = pd.to_datetime(df["time"], unit="ms")
         df[["open","high","low","close","volume"]] = df[
             ["open","high","low","close","volume"]
         ].astype(float)
@@ -124,14 +160,74 @@ class FuturesVWAPBot:
         return df
 
     # -------------------------
-    def fetch_price(self):
+    def open_trade(self, side, price, atr_val):
 
-        data = safe_api_call(lambda: client.get_symbol_ticker(symbol=SYMBOL))
+        if self.position:
+            log("Already in position")
+            return
 
-        if not data:
-            return None
+        balance = self.get_balance()
+        qty = round_qty((balance * LEVERAGE) / price)
 
-        return float(data["price"])
+        if qty <= 0:
+            log("Qty too small")
+            return
+
+        if self.last_price and abs(price - self.last_price)/price > SLIPPAGE_THRESHOLD:
+            log("Slippage too high")
+            return
+
+        self.cancel_open_orders()
+
+        try:
+            order = safe_call(lambda: client.futures_create_order(
+                symbol=SYMBOL,
+                side="BUY" if side=="LONG" else "SELL",
+                type="MARKET",
+                quantity=qty
+            ))
+
+            if not order:
+                return
+
+            avg_price = float(order.get("avgPrice", price))
+
+            self.position = side
+            self.qty = qty
+            self.entry_price = avg_price
+
+            if side == "LONG":
+                sl = avg_price - atr_val * SL_MULT
+                tp = avg_price + atr_val * TP_MULT
+            else:
+                sl = avg_price + atr_val * SL_MULT
+                tp = avg_price - atr_val * TP_MULT
+
+            self.place_sl_tp(side, sl, tp)
+
+            log(f"{side} @ {avg_price} qty={qty}")
+
+        except Exception as e:
+            log(e)
+
+    # -------------------------
+    def place_sl_tp(self, side, sl, tp):
+
+        safe_call(lambda: client.futures_create_order(
+            symbol=SYMBOL,
+            side="SELL" if side=="LONG" else "BUY",
+            type="STOP_MARKET",
+            stopPrice=round_price(sl),
+            closePosition=True
+        ))
+
+        safe_call(lambda: client.futures_create_order(
+            symbol=SYMBOL,
+            side="SELL" if side=="LONG" else "BUY",
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=round_price(tp),
+            closePosition=True
+        ))
 
     # -------------------------
     def check_entry(self):
@@ -140,9 +236,7 @@ class FuturesVWAPBot:
             return
 
         df = self.fetch_klines()
-
-        if df is None or df.empty:
-            print("⚠️ No data, skipping entry")
+        if df is None:
             return
 
         df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
@@ -151,132 +245,48 @@ class FuturesVWAPBot:
         df["VWAP"] = vwap(df)
 
         df = df.dropna()
-
-        if df.empty:
-            print("⚠️ Not enough data after indicators")
-            return
-
         last = df.iloc[-1]
+
         price = last["close"]
 
-        print(f"Price={price:.2f}, EMA={last['EMA']:.2f}, VWAP={last['VWAP']:.2f}, RSI={last['RSI']:.2f}")
-
-        # LONG
-        if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
+        if price > last["EMA"] and price < last["VWAP"]*1.002 and last["RSI"] < 45:
             self.open_trade("LONG", price, last["ATR"])
 
-        # SHORT
-        elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
+        elif price < last["EMA"] and price > last["VWAP"]*0.998 and last["RSI"] > 55:
             self.open_trade("SHORT", price, last["ATR"])
 
     # -------------------------
-    def open_trade(self, side, price, atr_value):
-
-        if atr_value is None or atr_value == 0:
-            print("⚠️ Invalid ATR")
-            return
-
-        self.position = side
-        self.entry_price = price
-
-        if side == "LONG":
-            self.sl = price - atr_value * SL_MULT
-            self.tp = price + atr_value * TP_MULT
-        else:
-            self.sl = price + atr_value * SL_MULT
-            self.tp = price - atr_value * TP_MULT
-
-        position_value = self.balance * LEVERAGE
-        self.position_size = position_value / price
-
-        print(f"📈 {side} ENTRY @ {price:.2f}")
-        print(f"🎯 TP={self.tp:.2f} | 🛑 SL={self.sl:.2f}")
+    def on_price(self, msg):
+        try:
+            self.last_price = float(msg["c"])
+        except:
+            pass
 
     # -------------------------
-    def manage_trade(self):
-
-        if not self.position:
-            return
-
-        price = self.fetch_price()
-
-        if price is None:
-            print("⚠️ Price fetch failed")
-            return
-
-        # STOP LOSS & TAKE PROFIT CHECK
-        if self.position == "LONG":
-            if price <= self.sl:
-                print("🛑 STOP LOSS HIT")
-                pnl = (price - self.entry_price) * self.position_size
-                self.close_trade(price, pnl)
-
-            elif price >= self.tp:
-                print("🎯 TAKE PROFIT HIT")
-                pnl = (price - self.entry_price) * self.position_size
-                self.close_trade(price, pnl)
-
-        elif self.position == "SHORT":
-            if price >= self.sl:
-                print("🛑 STOP LOSS HIT")
-                pnl = (self.entry_price - price) * self.position_size
-                self.close_trade(price, pnl)
-
-            elif price <= self.tp:
-                print("🎯 TAKE PROFIT HIT")
-                pnl = (self.entry_price - price) * self.position_size
-                self.close_trade(price, pnl)
-
-    # -------------------------
-    def close_trade(self, price, pnl):
-
-        entry_value = self.position_size * self.entry_price
-        exit_value = self.position_size * price
-
-        fee = (entry_value + exit_value) * FEE_RATE
-
-        net_pnl = pnl - fee
-        prev_balance = self.balance
-        self.balance += net_pnl
-
-        with open(self.logfile, "a", newline="") as f:
-            csv.writer(f).writerow([
-                datetime.utcnow(),
-                SYMBOL,
-                self.position,
-                self.entry_price,
-                price,
-                pnl,
-                fee,
-                net_pnl,
-                self.balance
-            ])
-
-        print("\n💰 TRADE CLOSED")
-        print(f"Balance: {prev_balance:.2f} → {self.balance:.2f}\n")
-
-        self.position = None
+    def start_ws(self):
+        while True:
+            try:
+                twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+                twm.start()
+                twm.start_symbol_ticker_socket(callback=self.on_price, symbol=SYMBOL)
+                log("WebSocket started")
+                break
+            except Exception as e:
+                log(f"WS restart: {e}")
+                time.sleep(5)
 
     # -------------------------
     def run(self):
 
-        print("🚀 Bot running...")
-        last_kline = 0
+        self.start_ws()
 
         while True:
             try:
-                now = time.time()
-
-                if now - last_kline >= KLINE_SLEEP:
-                    self.check_entry()
-                    last_kline = now
-
-                self.manage_trade()
-
+                self.check_entry()
             except Exception as e:
-                print(f"🚨 ERROR: {e}")
+                log(f"Loop error: {e}")
 
-            time.sleep(TICK_SLEEP)
+            time.sleep(SLEEP)
 
 # =============================
-FuturesVWAPBot().run()
+Bot().run()
