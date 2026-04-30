@@ -29,7 +29,7 @@ SL_MULT = 1.0
 
 SLEEP = 60
 MAX_RETRIES = 5
-SLIPPAGE_THRESHOLD = 0.002  # 0.2%
+SLIPPAGE_THRESHOLD = 0.002
 
 # =============================
 # LOGGING
@@ -62,21 +62,48 @@ def safe_call(func):
     return None
 
 # =============================
-# PRECISION
+# PRECISION + FILTERS
 # =============================
-def get_precision():
+def get_symbol_filters():
     info = safe_call(lambda: client.futures_exchange_info())
     for s in info["symbols"]:
         if s["symbol"] == SYMBOL:
-            step = float([f for f in s["filters"] if f["filterType"]=="LOT_SIZE"][0]["stepSize"])
-            tick = float([f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"][0]["tickSize"])
-            return step, tick
-    return 0.001, 0.1
+            filters = {f["filterType"]: f for f in s["filters"]}
 
-STEP, TICK = get_precision()
+            step = float(filters["LOT_SIZE"]["stepSize"])
+            min_qty = float(filters["LOT_SIZE"]["minQty"])
+            tick = float(filters["PRICE_FILTER"]["tickSize"])
+            min_notional = float(filters["MIN_NOTIONAL"]["notional"])
 
-def round_qty(q): return math.floor(q/STEP)*STEP
-def round_price(p): return round(p/TICK)*TICK
+            return step, min_qty, tick, min_notional
+
+    return 0.001, 0.001, 0.1, 20
+
+STEP, MIN_QTY, TICK, MIN_NOTIONAL = get_symbol_filters()
+
+def round_qty(q):
+    return math.floor(q / STEP) * STEP
+
+def round_price(p):
+    return round(p / TICK) * TICK
+
+# ✅ NEW: Adjust qty to exchange rules
+def adjust_qty(qty, price):
+    # enforce min qty
+    qty = max(qty, MIN_QTY)
+
+    # enforce min notional
+    if qty * price < MIN_NOTIONAL:
+        qty = math.ceil((MIN_NOTIONAL / price) / STEP) * STEP
+
+    # round properly
+    qty = round_qty(qty)
+
+    # final validation
+    if qty * price < MIN_NOTIONAL:
+        return None
+
+    return qty
 
 # =============================
 # INDICATORS
@@ -115,12 +142,10 @@ class Bot:
         self.set_leverage()
         self.sync_position()
 
-    # -------------------------
     def set_leverage(self):
         safe_call(lambda: client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE))
         log(f"Leverage set {LEVERAGE}x")
 
-    # -------------------------
     def get_balance(self):
         data = safe_call(lambda: client.futures_account_balance())
         for b in data:
@@ -128,7 +153,6 @@ class Bot:
                 return float(b["balance"])
         return 0
 
-    # -------------------------
     def sync_position(self):
         pos = safe_call(lambda: client.futures_position_information(symbol=SYMBOL))
         for p in pos:
@@ -139,11 +163,9 @@ class Bot:
                 self.position = "LONG" if amt > 0 else "SHORT"
                 log(f"Synced: {self.position} {self.qty}")
 
-    # -------------------------
     def cancel_open_orders(self):
         safe_call(lambda: client.futures_cancel_all_open_orders(symbol=SYMBOL))
 
-    # -------------------------
     def fetch_klines(self):
         data = safe_call(lambda: client.futures_klines(symbol=SYMBOL, interval="5m", limit=300))
         if not data:
@@ -159,7 +181,9 @@ class Bot:
 
         return df
 
-    # -------------------------
+    # =========================
+    # FIXED TRADE LOGIC
+    # =========================
     def open_trade(self, side, price, atr_val):
 
         if self.position:
@@ -167,11 +191,15 @@ class Bot:
             return
 
         balance = self.get_balance()
-        qty = round_qty((balance * LEVERAGE) / price)
 
-        if qty <= 0:
-            log("Qty too small")
+        raw_qty = (balance * LEVERAGE) / price
+        qty = adjust_qty(raw_qty, price)
+
+        if qty is None:
+            log("Qty too small after adjustment (MIN_NOTIONAL fail)")
             return
+
+        log(f"Final Qty: {qty}, Notional: {qty * price}")
 
         if self.last_price and abs(price - self.last_price)/price > SLIPPAGE_THRESHOLD:
             log("Slippage too high")
@@ -210,7 +238,6 @@ class Bot:
         except Exception as e:
             log(e)
 
-    # -------------------------
     def place_sl_tp(self, side, sl, tp):
 
         safe_call(lambda: client.futures_create_order(
@@ -229,7 +256,6 @@ class Bot:
             closePosition=True
         ))
 
-    # -------------------------
     def check_entry(self):
 
         if self.position:
@@ -255,14 +281,12 @@ class Bot:
         elif price < last["EMA"] and price > last["VWAP"]*0.998 and last["RSI"] > 55:
             self.open_trade("SHORT", price, last["ATR"])
 
-    # -------------------------
     def on_price(self, msg):
         try:
             self.last_price = float(msg["c"])
         except:
             pass
 
-    # -------------------------
     def start_ws(self):
         while True:
             try:
@@ -275,7 +299,6 @@ class Bot:
                 log(f"WS restart: {e}")
                 time.sleep(5)
 
-    # -------------------------
     def run(self):
 
         self.start_ws()
