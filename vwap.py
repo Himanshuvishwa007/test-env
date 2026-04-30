@@ -6,12 +6,11 @@ import pandas as pd
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from binance.client import Client
-from binance import ThreadedWebsocketManager
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-# =============================
+# =========================
 # CONFIG
-# =============================
+# =========================
 load_dotenv()
 
 API_KEY = os.getenv("BINANCE_LIVE_API_KEY")
@@ -25,280 +24,228 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 VWAP_WINDOW = 288
 
-TP_MULT = 1.5
-SL_MULT = 1.0
+RISK_PER_TRADE = 0.01  # 1%
 
 SLEEP = 60
 MAX_RETRIES = 5
-SLIPPAGE_THRESHOLD = 0.002
 
-# =============================
-# LOGGING
-# =============================
-logging.basicConfig(
-    filename="bot.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 
-def log(msg):
-    print(msg)
-    logging.info(msg)
+def log(x):
+    print(x)
 
 client = Client(API_KEY, API_SECRET)
 
-# =============================
+# =========================
 # SAFE CALL
-# =============================
+# =========================
 def safe_call(func):
     for i in range(MAX_RETRIES):
         try:
             return func()
-        except (BinanceAPIException, BinanceRequestException) as e:
-            log(f"Retry {i+1}: {e}")
-            time.sleep(2 ** i)
         except Exception as e:
-            log(f"Unknown error {i+1}: {e}")
+            log(f"Retry {i+1}: {e}")
             time.sleep(2 ** i)
     return None
 
-# =============================
-# GET SYMBOL FILTERS
-# =============================
+# =========================
+# EXCHANGE CONFIG
+# =========================
 def get_filters():
     info = safe_call(lambda: client.futures_exchange_info())
 
     for s in info["symbols"]:
         if s["symbol"] == SYMBOL:
-            filters = {f["filterType"]: f for f in s["filters"]}
+            f = {x["filterType"]: x for x in s["filters"]}
 
-            step = float(filters["LOT_SIZE"]["stepSize"])
-            min_qty = float(filters["LOT_SIZE"]["minQty"])
-            tick = float(filters["PRICE_FILTER"]["tickSize"])
-            min_notional = float(filters["MIN_NOTIONAL"]["notional"])
+            return {
+                "step": float(f["LOT_SIZE"]["stepSize"]),
+                "min_qty": float(f["LOT_SIZE"]["minQty"]),
+                "tick": float(f["PRICE_FILTER"]["tickSize"]),
+                "min_notional": float(f["MIN_NOTIONAL"]["notional"])
+            }
 
-            return step, min_qty, tick, min_notional
+    return {"step": 0.001, "min_qty": 0.001, "tick": 0.1, "min_notional": 20}
 
-    return 0.001, 0.001, 0.1, 20
+F = get_filters()
 
-STEP, MIN_QTY, TICK, MIN_NOTIONAL = get_filters()
-
-# =============================
+# =========================
 # PRECISION SAFE ROUNDING
-# =============================
-def round_qty(qty):
-    precision = int(round(-math.log10(STEP)))
-    qty = math.floor(qty / STEP) * STEP
+# =========================
+def round_qty(q):
+    q = math.floor(q / F["step"]) * F["step"]
+    return float(Decimal(str(q)).quantize(Decimal(str(F["step"])), ROUND_DOWN))
 
-    return float(
-        Decimal(str(qty)).quantize(
-            Decimal(str(STEP)),
-            rounding=ROUND_DOWN
-        )
-    )
+def round_price(p):
+    return round(p / F["tick"]) * F["tick"]
 
-def round_price(price):
-    return round(price / TICK) * TICK
+# =========================
+# POSITION SYNC (NO GHOST TRADES)
+# =========================
+def get_position():
+    data = safe_call(lambda: client.futures_position_information(symbol=SYMBOL))
+    for p in data:
+        amt = float(p["positionAmt"])
+        if amt != 0:
+            return {
+                "side": "LONG" if amt > 0 else "SHORT",
+                "qty": abs(amt),
+                "entry": float(p["entryPrice"])
+            }
+    return None
 
-# =============================
-# QTY ADJUSTMENT (FIXED)
-# =============================
-def adjust_qty(qty, price):
-    qty = max(qty, MIN_QTY)
-
-    # enforce notional
-    if qty * price < MIN_NOTIONAL:
-        qty = math.ceil((MIN_NOTIONAL / price) / STEP) * STEP
+# =========================
+# RISK-BASED QTY (IMPORTANT UPGRADE)
+# =========================
+def calc_qty(balance, price, atr):
+    risk_amount = balance * RISK_PER_TRADE
+    qty = risk_amount / atr  # ATR-based risk model
 
     qty = round_qty(qty)
 
-    # final safety check
-    if qty * price < MIN_NOTIONAL:
+    if qty * price < F["min_notional"]:
+        qty = math.ceil((F["min_notional"] / price) / F["step"]) * F["step"]
+
+    qty = round_qty(qty)
+
+    if qty * price < F["min_notional"]:
         return None
 
     return qty
 
-# =============================
-# INDICATORS
-# =============================
+# =========================
+# STRATEGY (YOUR EXISTING LOGIC)
+# =========================
+def get_signal(df):
+    df["ema"] = df["close"].ewm(span=EMA_TREND).mean()
+    df["rsi"] = rsi(df["close"], RSI_PERIOD)
+
+    last = df.iloc[-1]
+
+    if last["close"] > last["ema"] and last["rsi"] < 45:
+        return "LONG"
+
+    if last["close"] < last["ema"] and last["rsi"] > 55:
+        return "SHORT"
+
+    return None
+
 def rsi(series, period):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     rs = gain.rolling(period).mean() / loss.rolling(period).mean()
-    return 100 - (100/(1+rs))
+    return 100 - (100 / (1 + rs))
 
-def atr(df, period):
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+# =========================
+# EXECUTION ENGINE (FIXED CORE)
+# =========================
+def place_order(side, qty):
+    return safe_call(lambda: client.futures_create_order(
+        symbol=SYMBOL,
+        side="BUY" if side == "LONG" else "SELL",
+        type="MARKET",
+        quantity=qty
+    ))
 
-def vwap(df):
-    pv = (df["close"] * df["volume"]).rolling(VWAP_WINDOW).sum()
-    vol = df["volume"].rolling(VWAP_WINDOW).sum()
-    return pv / vol
+# =========================
+# SL / TP (SAFE MODE - NO -4120)
+# =========================
+def place_sl_tp(side, qty, sl, tp):
+    exit_side = "SELL" if side == "LONG" else "BUY"
 
-# =============================
-# BOT CLASS
-# =============================
-class Bot:
+    safe_call(lambda: client.futures_create_order(
+        symbol=SYMBOL,
+        side=exit_side,
+        type="STOP_MARKET",
+        stopPrice=round_price(sl),
+        quantity=qty,
+        reduceOnly=True
+    ))
 
-    def __init__(self):
-        self.position = None
-        self.qty = 0
-        self.entry_price = 0
-        self.last_price = None
+    safe_call(lambda: client.futures_create_order(
+        symbol=SYMBOL,
+        side=exit_side,
+        type="TAKE_PROFIT_MARKET",
+        stopPrice=round_price(tp),
+        quantity=qty,
+        reduceOnly=True
+    ))
 
-        self.set_leverage()
-        self.sync_position()
+# =========================
+# MAIN LOOP (PRODUCTION FLOW)
+# =========================
+def run():
 
-    def set_leverage(self):
-        safe_call(lambda: client.futures_change_leverage(
-            symbol=SYMBOL,
-            leverage=LEVERAGE
-        ))
-        log(f"Leverage set {LEVERAGE}x")
+    client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
-    def get_balance(self):
-        data = safe_call(lambda: client.futures_account_balance())
-        for b in data:
-            if b["asset"] in ["USDT", "FDUSD"]:
-                return float(b["balance"])
-        return 0
+    log("BOT STARTED (PRO MODE)")
 
-    def sync_position(self):
-        pos = safe_call(lambda: client.futures_position_information(symbol=SYMBOL))
-        for p in pos:
-            amt = float(p["positionAmt"])
-            if amt != 0:
-                self.qty = abs(amt)
-                self.entry_price = float(p["entryPrice"])
-                self.position = "LONG" if amt > 0 else "SHORT"
-                log(f"Synced: {self.position} {self.qty}")
+    while True:
 
-    def fetch_klines(self):
-        data = safe_call(lambda: client.futures_klines(
+        df = safe_call(lambda: client.futures_klines(
             symbol=SYMBOL,
             interval="5m",
             limit=300
         ))
 
-        if not data:
-            return None
+        if not df:
+            continue
 
-        df = pd.DataFrame(data, columns=[
-            "time","open","high","low","close","volume",
+        df = pd.DataFrame(df, columns=[
+            "t","o","h","l","c","v",
             "_","_","_","_","_","_"
         ])
 
-        df[["open","high","low","close","volume"]] = df[
-            ["open","high","low","close","volume"]
-        ].astype(float)
+        df[["o","h","l","c","v"]] = df[["o","h","l","c","v"]].astype(float)
 
-        return df
+        price = df["c"].iloc[-1]
 
-    # =============================
-    # TRADE EXECUTION (FIXED)
-    # =============================
-    def open_trade(self, side, price, atr_val):
+        position = get_position()
 
-        if self.position:
-            return
+        signal = get_signal(df)
 
-        balance = self.get_balance()
-
-        raw_qty = (balance * LEVERAGE) / price
-        qty = adjust_qty(raw_qty, price)
-
-        if qty is None:
-            log("Qty too small after adjustment (MIN_NOTIONAL fail)")
-            return
-
-        log(f"Final Qty: {qty}, Notional: {qty * price}")
-
-        self.last_price = price
-
-        try:
-            order = safe_call(lambda: client.futures_create_order(
-                symbol=SYMBOL,
-                side="BUY" if side == "LONG" else "SELL",
-                type="MARKET",
-                quantity=qty
-            ))
-
-            if not order:
-                return
-
-            avg_price = float(order.get("avgPrice", price))
-
-            self.position = side
-            self.qty = qty
-            self.entry_price = avg_price
-
-            if side == "LONG":
-                sl = avg_price - atr_val * SL_MULT
-                tp = avg_price + atr_val * TP_MULT
-            else:
-                sl = avg_price + atr_val * SL_MULT
-                tp = avg_price - atr_val * TP_MULT
-
-            self.place_sl_tp(side, sl, tp)
-
-            log(f"{side} @ {avg_price} qty={qty}")
-
-        except Exception as e:
-            log(e)
-
-    def place_sl_tp(self, side, sl, tp):
-
-        safe_call(lambda: client.futures_create_order(
-            symbol=SYMBOL,
-            side="SELL" if side == "LONG" else "BUY",
-            type="STOP_MARKET",
-            stopPrice=round_price(sl),
-            closePosition=True
-        ))
-
-        safe_call(lambda: client.futures_create_order(
-            symbol=SYMBOL,
-            side="SELL" if side == "LONG" else "BUY",
-            type="TAKE_PROFIT_MARKET",
-            stopPrice=round_price(tp),
-            closePosition=True
-        ))
-
-    def run(self):
-        log("Bot started")
-
-        while True:
-            try:
-                df = self.fetch_klines()
-                if df is None:
-                    continue
-
-                df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
-                df["RSI"] = rsi(df["close"], RSI_PERIOD)
-                df["ATR"] = atr(df, ATR_PERIOD)
-                df["VWAP"] = vwap(df)
-
-                df = df.dropna()
-                last = df.iloc[-1]
-
-                price = last["close"]
-
-                if price > last["EMA"] and last["RSI"] < 45:
-                    self.open_trade("LONG", price, last["ATR"])
-
-                elif price < last["EMA"] and last["RSI"] > 55:
-                    self.open_trade("SHORT", price, last["ATR"])
-
-            except Exception as e:
-                log(f"Loop error: {e}")
-
+        if position:
+            log(f"Position exists: {position}")
             time.sleep(SLEEP)
+            continue
 
-# =============================
-Bot().run()
+        if not signal:
+            time.sleep(SLEEP)
+            continue
+
+        balance = float(client.futures_account_balance()[0]["balance"])
+
+        atr_val = (df["h"] - df["l"]).rolling(14).mean().iloc[-1]
+
+        qty = calc_qty(balance, price, atr_val)
+
+        if not qty:
+            log("Qty invalid")
+            time.sleep(SLEEP)
+            continue
+
+        log(f"Signal: {signal} Qty: {qty}")
+
+        order = place_order(signal, qty)
+
+        if not order:
+            continue
+
+        avg = price
+
+        if signal == "LONG":
+            sl = avg - atr_val
+            tp = avg + atr_val * 1.5
+        else:
+            sl = avg + atr_val
+            tp = avg - atr_val * 1.5
+
+        place_sl_tp(signal, qty, sl, tp)
+
+        log(f"{signal} executed @ {avg}")
+
+        time.sleep(SLEEP)
+
+# =========================
+run()
