@@ -6,7 +6,6 @@ import pandas as pd
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
 
 # =============================
 # CONFIG
@@ -18,6 +17,7 @@ API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 
 SYMBOL = "ETHUSDT"
 LEVERAGE = 2
+RISK_PERCENT = 0.3   # 30% capital
 
 EMA_TREND = 200
 RSI_PERIOD = 14
@@ -30,9 +30,8 @@ SL_MULT = 1.0
 SLEEP = 60
 MAX_RETRIES = 5
 
-# =============================
 logging.basicConfig(level=logging.INFO)
-def log(x): print(x)
+log = print
 
 client = Client(API_KEY, API_SECRET)
 
@@ -59,7 +58,7 @@ HEDGE = is_hedge()
 log(f"Hedge Mode: {HEDGE}")
 
 # =============================
-# FILTERS
+# FILTERS (FIXED)
 # =============================
 def get_filters():
     info = safe_call(lambda: client.futures_exchange_info())
@@ -68,15 +67,36 @@ def get_filters():
             f = {x["filterType"]: x for x in s["filters"]}
             return {
                 "step": float(f["LOT_SIZE"]["stepSize"]),
+                "min_qty": float(f["LOT_SIZE"]["minQty"]),
                 "min_notional": float(f["MIN_NOTIONAL"]["notional"])
             }
-    return {"step": 0.001, "min_notional": 20}
+    return {"step": 0.001, "min_qty": 0.001, "min_notional": 20}
 
 F = get_filters()
 
+# =============================
+# ROUND QTY
+# =============================
 def round_qty(q):
     q = math.floor(q / F["step"]) * F["step"]
     return float(Decimal(str(q)).quantize(Decimal(str(F["step"])), ROUND_DOWN))
+
+# =============================
+# GET BALANCE (FIXED)
+# =============================
+def get_usdt_balance():
+    balances = safe_call(lambda: client.futures_account_balance())
+    for b in balances:
+        if b["asset"] == "USDT":
+            return float(b["balance"])
+    return 0
+
+# =============================
+# POSITION SIZE (FIXED)
+# =============================
+def calculate_qty(balance, price):
+    raw_qty = (balance * RISK_PERCENT * LEVERAGE) / price
+    return round_qty(raw_qty)
 
 # =============================
 # INDICATORS
@@ -125,10 +145,9 @@ def emergency_close(qty, side):
     ))
 
 # =============================
-# SL/TP (SAFE)
+# SL/TP
 # =============================
 def place_sl_tp(side, qty, sl, tp):
-
     exit_side = "SELL" if side == "LONG" else "BUY"
 
     params = {
@@ -145,13 +164,13 @@ def place_sl_tp(side, qty, sl, tp):
     sl_order = safe_call(lambda: client.futures_create_order(
         **params,
         type="STOP_MARKET",
-        stopPrice=sl
+        stopPrice=round(sl, 2)
     ))
 
     tp_order = safe_call(lambda: client.futures_create_order(
         **params,
         type="TAKE_PROFIT_MARKET",
-        stopPrice=tp
+        stopPrice=round(tp, 2)
     ))
 
     return sl_order and tp_order
@@ -160,96 +179,103 @@ def place_sl_tp(side, qty, sl, tp):
 # MAIN LOOP
 # =============================
 def run():
-
-    log("BOT STARTED (FINAL VERSION)")
+    log("🚀 BOT STARTED (FINAL FIXED VERSION)")
 
     while True:
+        try:
+            data = safe_call(lambda: client.futures_klines(
+                symbol=SYMBOL,
+                interval="5m",
+                limit=300
+            ))
 
-        data = safe_call(lambda: client.futures_klines(
-            symbol=SYMBOL,
-            interval="5m",
-            limit=300
-        ))
+            if not data:
+                continue
 
-        if not data:
-            continue
+            df = pd.DataFrame(data, columns=[
+                "time","open","high","low","close","volume",
+                "_","_","_","_","_","_"
+            ])
 
-        # ✔ FIXED COLUMN NAMES
-        df = pd.DataFrame(data, columns=[
-            "time","open","high","low","close","volume",
-            "_","_","_","_","_","_"
-        ])
+            df[["open","high","low","close","volume"]] = df[
+                ["open","high","low","close","volume"]
+            ].astype(float)
 
-        df[["open","high","low","close","volume"]] = df[
-            ["open","high","low","close","volume"]
-        ].astype(float)
+            df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
+            df["RSI"] = rsi(df["close"], RSI_PERIOD)
+            df["ATR"] = atr(df, ATR_PERIOD)
+            df["VWAP"] = vwap(df)
 
-        # INDICATORS
-        df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
-        df["RSI"] = rsi(df["close"], RSI_PERIOD)
-        df["ATR"] = atr(df, ATR_PERIOD)
-        df["VWAP"] = vwap(df)
+            df = df.dropna()
+            last = df.iloc[-1]
+            price = last["close"]
 
-        df = df.dropna()
-        last = df.iloc[-1]
+            if has_position():
+                log("Position exists")
+                time.sleep(SLEEP)
+                continue
 
-        price = last["close"]
+            # SIGNAL
+            if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
+                side = "LONG"
+            elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
+                side = "SHORT"
+            else:
+                time.sleep(SLEEP)
+                continue
 
-        if has_position():
-            log("Position exists")
+            # QTY FIXED
+            balance = get_usdt_balance()
+            qty = calculate_qty(balance, price)
+            notional = qty * price
+
+            log(f"Balance: {balance}")
+            log(f"Price: {price}")
+            log(f"Qty: {qty}")
+            log(f"Notional: {notional}")
+            log(f"MinQty: {F['min_qty']} | MinNotional: {F['min_notional']}")
+
+            if qty < F["min_qty"]:
+                log("❌ Qty too small → Skipping")
+                time.sleep(SLEEP)
+                continue
+
+            if notional < F["min_notional"]:
+                log("❌ Notional too small → Skipping")
+                time.sleep(SLEEP)
+                continue
+
+            # ENTRY
+            order = safe_call(lambda: client.futures_create_order(
+                symbol=SYMBOL,
+                side="BUY" if side=="LONG" else "SELL",
+                type="MARKET",
+                quantity=qty
+            ))
+
+            if not order:
+                continue
+
+            avg = float(order.get("avgPrice", 0)) or price
+            log(f"✅ {side} @ {avg}")
+
+            # SL TP
+            if side == "LONG":
+                sl = avg - last["ATR"] * SL_MULT
+                tp = avg + last["ATR"] * TP_MULT
+            else:
+                sl = avg + last["ATR"] * SL_MULT
+                tp = avg - last["ATR"] * TP_MULT
+
+            if not place_sl_tp(side, qty, sl, tp):
+                log("❌ SL/TP failed")
+                emergency_close(qty, side)
+
             time.sleep(SLEEP)
-            continue
 
-        # =============================
-        # YOUR ORIGINAL STRATEGY
-        # =============================
-        if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
-            side = "LONG"
-
-        elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
-            side = "SHORT"
-
-        else:
-            time.sleep(SLEEP)
-            continue
-
-        # QTY
-        balance = float(client.futures_account_balance()[0]["balance"])
-        qty = round_qty((balance * LEVERAGE) / price)
-
-        if qty * price < F["min_notional"]:
-            log("Qty too small")
-            time.sleep(SLEEP)
-            continue
-
-        # ENTRY
-        order = safe_call(lambda: client.futures_create_order(
-            symbol=SYMBOL,
-            side="BUY" if side=="LONG" else "SELL",
-            type="MARKET",
-            quantity=qty
-        ))
-
-        if not order:
-            continue
-
-        avg = float(order.get("avgPrice", 0)) or price
-        log(f"{side} @ {avg}")
-
-        # ATR BASED SL/TP
-        if side == "LONG":
-            sl = avg - last["ATR"] * SL_MULT
-            tp = avg + last["ATR"] * TP_MULT
-        else:
-            sl = avg + last["ATR"] * SL_MULT
-            tp = avg - last["ATR"] * TP_MULT
-
-        # PROTECTION
-        if not place_sl_tp(side, qty, sl, tp):
-            log("❌ SL/TP failed")
-            emergency_close(qty, side)
-
-        time.sleep(SLEEP)
+        except Exception as e:
+            log(f"MAIN ERROR: {e}")
+            time.sleep(10)
 
 # =============================
 run()
