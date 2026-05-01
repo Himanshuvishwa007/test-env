@@ -1,11 +1,13 @@
 import os
 import time
 import math
-import logging
+import json
+import threading
 import pandas as pd
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from binance.client import Client
+from websocket import WebSocketApp
 
 # =============================
 # CONFIG
@@ -15,9 +17,11 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_LIVE_API_KEY")
 API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 
-SYMBOL = "ETHUSDT"
+SYMBOL = "ethusdt"   # lowercase for websocket
+SYMBOL_UPPER = "ETHUSDT"
+
 LEVERAGE = 2
-RISK_PERCENT = 0.3   # 30% capital
+RISK_PERCENT = 0.3
 
 EMA_TREND = 200
 RSI_PERIOD = 14
@@ -27,76 +31,36 @@ VWAP_WINDOW = 288
 TP_MULT = 1.5
 SL_MULT = 1.0
 
-SLEEP = 60
-MAX_RETRIES = 5
-
-logging.basicConfig(level=logging.INFO)
-log = print
-
 client = Client(API_KEY, API_SECRET)
 
 # =============================
-# SAFE CALL
-# =============================
-def safe_call(func):
-    for i in range(MAX_RETRIES):
-        try:
-            return func()
-        except Exception as e:
-            log(f"Retry {i+1}: {e}")
-            time.sleep(2 ** i)
-    return None
-
-# =============================
-# MODE DETECTION
-# =============================
-def is_hedge():
-    acc = safe_call(lambda: client.futures_account())
-    return acc.get("dualSidePosition", False)
-
-HEDGE = is_hedge()
-log(f"Hedge Mode: {HEDGE}")
-
-# =============================
-# FILTERS (FIXED)
+# FILTERS
 # =============================
 def get_filters():
-    info = safe_call(lambda: client.futures_exchange_info())
+    info = client.futures_exchange_info()
     for s in info["symbols"]:
-        if s["symbol"] == SYMBOL:
+        if s["symbol"] == SYMBOL_UPPER:
             f = {x["filterType"]: x for x in s["filters"]}
             return {
                 "step": float(f["LOT_SIZE"]["stepSize"]),
                 "min_qty": float(f["LOT_SIZE"]["minQty"]),
                 "min_notional": float(f["MIN_NOTIONAL"]["notional"])
             }
-    return {"step": 0.001, "min_qty": 0.001, "min_notional": 20}
-
 F = get_filters()
 
-# =============================
-# ROUND QTY
-# =============================
 def round_qty(q):
     q = math.floor(q / F["step"]) * F["step"]
     return float(Decimal(str(q)).quantize(Decimal(str(F["step"])), ROUND_DOWN))
 
 # =============================
-# GET BALANCE (FIXED)
+# BALANCE
 # =============================
-def get_usdt_balance():
-    balances = safe_call(lambda: client.futures_account_balance())
+def get_balance():
+    balances = client.futures_account_balance()
     for b in balances:
         if b["asset"] == "USDT":
             return float(b["balance"])
     return 0
-
-# =============================
-# POSITION SIZE (FIXED)
-# =============================
-def calculate_qty(balance, price):
-    raw_qty = (balance * RISK_PERCENT * LEVERAGE) / price
-    return round_qty(raw_qty)
 
 # =============================
 # INDICATORS
@@ -125,157 +89,106 @@ def vwap(df):
 # POSITION CHECK
 # =============================
 def has_position():
-    pos = safe_call(lambda: client.futures_position_information(symbol=SYMBOL))
+    pos = client.futures_position_information(symbol=SYMBOL_UPPER)
     for p in pos:
         if float(p["positionAmt"]) != 0:
             return True
     return False
 
 # =============================
-# EMERGENCY CLOSE
+# ORDER EXECUTION
 # =============================
-def emergency_close(qty, side):
-    log("🚨 Emergency closing position")
-    safe_call(lambda: client.futures_create_order(
-        symbol=SYMBOL,
-        side="SELL" if side=="LONG" else "BUY",
+def execute_trade(df):
+
+    if len(df) < 250:
+        return
+
+    last = df.iloc[-1]
+    price = last["close"]
+
+    if has_position():
+        print("Position exists")
+        return
+
+    # SIGNAL
+    if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
+        side = "LONG"
+    elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
+        side = "SHORT"
+    else:
+        print("No signal")
+        return
+
+    balance = get_balance()
+    qty = round_qty((balance * RISK_PERCENT * LEVERAGE) / price)
+    notional = qty * price
+
+    print(f"Balance: {balance}, Qty: {qty}, Notional: {notional}")
+
+    if qty < F["min_qty"] or notional < F["min_notional"]:
+        print("❌ Qty too small → Skipping")
+        return
+
+    order = client.futures_create_order(
+        symbol=SYMBOL_UPPER,
+        side="BUY" if side=="LONG" else "SELL",
         type="MARKET",
-        quantity=qty,
-        reduceOnly=True
-    ))
+        quantity=qty
+    )
+
+    avg = float(order.get("avgPrice", 0)) or price
+    print(f"✅ {side} @ {avg}")
 
 # =============================
-# SL/TP
+# DATA STORAGE
 # =============================
-def place_sl_tp(side, qty, sl, tp):
-    exit_side = "SELL" if side == "LONG" else "BUY"
+df = pd.DataFrame(columns=["open","high","low","close","volume"])
 
-    params = {
-        "symbol": SYMBOL,
-        "side": exit_side,
-        "quantity": qty,
-        "reduceOnly": True,
-        "workingType": "MARK_PRICE"
+# =============================
+# WEBSOCKET HANDLER
+# =============================
+def on_message(ws, message):
+    global df
+
+    msg = json.loads(message)
+    k = msg['k']
+
+    is_closed = k['x']
+
+    if not is_closed:
+        return  # only act on candle close
+
+    new_row = {
+        "open": float(k['o']),
+        "high": float(k['h']),
+        "low": float(k['l']),
+        "close": float(k['c']),
+        "volume": float(k['v'])
     }
 
-    if HEDGE:
-        params["positionSide"] = side
+    df = pd.concat([df, pd.DataFrame([new_row])]).tail(300)
 
-    sl_order = safe_call(lambda: client.futures_create_order(
-        **params,
-        type="STOP_MARKET",
-        stopPrice=round(sl, 2)
-    ))
+    # indicators
+    df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
+    df["RSI"] = rsi(df["close"], RSI_PERIOD)
+    df["ATR"] = atr(df, ATR_PERIOD)
+    df["VWAP"] = vwap(df)
 
-    tp_order = safe_call(lambda: client.futures_create_order(
-        **params,
-        type="TAKE_PROFIT_MARKET",
-        stopPrice=round(tp, 2)
-    ))
+    print("New candle closed")
 
-    return sl_order and tp_order
+    execute_trade(df)
 
 # =============================
-# MAIN LOOP
+# WEBSOCKET START
 # =============================
-def run():
-    log("🚀 BOT STARTED (FINAL FIXED VERSION)")
-
-    while True:
-        try:
-            data = safe_call(lambda: client.futures_klines(
-                symbol=SYMBOL,
-                interval="5m",
-                limit=300
-            ))
-
-            if not data:
-                continue
-
-            df = pd.DataFrame(data, columns=[
-                "time","open","high","low","close","volume",
-                "_","_","_","_","_","_"
-            ])
-
-            df[["open","high","low","close","volume"]] = df[
-                ["open","high","low","close","volume"]
-            ].astype(float)
-
-            df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
-            df["RSI"] = rsi(df["close"], RSI_PERIOD)
-            df["ATR"] = atr(df, ATR_PERIOD)
-            df["VWAP"] = vwap(df)
-
-            df = df.dropna()
-            last = df.iloc[-1]
-            price = last["close"]
-
-            if has_position():
-                log("Position exists")
-                time.sleep(SLEEP)
-                continue
-
-            # SIGNAL
-            if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
-                side = "LONG"
-            elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
-                side = "SHORT"
-            else:
-                time.sleep(SLEEP)
-                continue
-
-            # QTY FIXED
-            balance = get_usdt_balance()
-            qty = calculate_qty(balance, price)
-            notional = qty * price
-
-            log(f"Balance: {balance}")
-            log(f"Price: {price}")
-            log(f"Qty: {qty}")
-            log(f"Notional: {notional}")
-            log(f"MinQty: {F['min_qty']} | MinNotional: {F['min_notional']}")
-
-            if qty < F["min_qty"]:
-                log("❌ Qty too small → Skipping")
-                time.sleep(SLEEP)
-                continue
-
-            if notional < F["min_notional"]:
-                log("❌ Notional too small → Skipping")
-                time.sleep(SLEEP)
-                continue
-
-            # ENTRY
-            order = safe_call(lambda: client.futures_create_order(
-                symbol=SYMBOL,
-                side="BUY" if side=="LONG" else "SELL",
-                type="MARKET",
-                quantity=qty
-            ))
-
-            if not order:
-                continue
-
-            avg = float(order.get("avgPrice", 0)) or price
-            log(f"✅ {side} @ {avg}")
-
-            # SL TP
-            if side == "LONG":
-                sl = avg - last["ATR"] * SL_MULT
-                tp = avg + last["ATR"] * TP_MULT
-            else:
-                sl = avg + last["ATR"] * SL_MULT
-                tp = avg - last["ATR"] * TP_MULT
-
-            if not place_sl_tp(side, qty, sl, tp):
-                log("❌ SL/TP failed")
-                emergency_close(qty, side)
-
-            time.sleep(SLEEP)
-
-        except Exception as e:
-            log(f"MAIN ERROR: {e}")
-            time.sleep(10)
+def start_ws():
+    url = f"wss://fstream.binance.com/ws/{SYMBOL}@kline_5m"
+    ws = WebSocketApp(url, on_message=on_message)
+    ws.run_forever()
 
 # =============================
-run()
+# START
+# =============================
+if __name__ == "__main__":
+    print("🚀 WebSocket Bot Started")
+    start_ws()
