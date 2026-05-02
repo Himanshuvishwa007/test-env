@@ -111,7 +111,7 @@ def execute_trade(df):
         print("Position exists")
         return
 
-    # SIGNAL
+    # SIGNAL (UNCHANGED)
     if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
         side = "LONG"
     elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
@@ -146,7 +146,7 @@ def execute_trade(df):
 df = pd.DataFrame(columns=["open","high","low","close","volume"])
 
 # =============================
-# LOAD HISTORICAL DATA (FIX)
+# LOAD HISTORICAL DATA
 # =============================
 def load_history():
     global df
@@ -171,7 +171,6 @@ def load_history():
 
     df = pd.DataFrame(data)
 
-    # indicators (UNCHANGED LOGIC)
     df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
     df["RSI"] = rsi(df["close"], RSI_PERIOD)
     df["ATR"] = atr(df, ATR_PERIOD)
@@ -180,50 +179,88 @@ def load_history():
     print("✅ Historical loaded:", len(df))
 
 # =============================
-# WEBSOCKET HANDLER
+# WEBSOCKET HANDLER (FIXED)
 # =============================
 def on_message(ws, message):
     global df
 
-    msg = json.loads(message)
-    k = msg['k']
+    try:
+        msg = json.loads(message)
 
-    if not k['x']:
-        return  # only closed candle
+        if 'k' not in msg:
+            return
 
-    new_row = {
-        "open": float(k['o']),
-        "high": float(k['h']),
-        "low": float(k['l']),
-        "close": float(k['c']),
-        "volume": float(k['v'])
-    }
+        k = msg['k']
 
-    df = pd.concat([df, pd.DataFrame([new_row])]).tail(300)
+        # 🔹 HEARTBEAT
+        print(f"📡 Live Tick: {k['c']} | Closed: {k['x']}")
 
-    # indicators (UNCHANGED)
-    df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
-    df["RSI"] = rsi(df["close"], RSI_PERIOD)
-    df["ATR"] = atr(df, ATR_PERIOD)
-    df["VWAP"] = vwap(df)
+        if not k['x']:
+            return
 
-    last = df.iloc[-1]
+        new_row = {
+            "open": float(k['o']),
+            "high": float(k['h']),
+            "low": float(k['l']),
+            "close": float(k['c']),
+            "volume": float(k['v'])
+        }
 
-    print("\n📊 New Candle Closed")
-    print(f"Price: {last['close']}")
-    print(f"EMA: {last['EMA']}")
-    print(f"VWAP: {last['VWAP']}")
-    print(f"RSI: {last['RSI']}")
+        df = pd.concat([df, pd.DataFrame([new_row])]).tail(300)
 
-    execute_trade(df)
+        df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
+        df["RSI"] = rsi(df["close"], RSI_PERIOD)
+        df["ATR"] = atr(df, ATR_PERIOD)
+        df["VWAP"] = vwap(df)
+
+        last = df.iloc[-1]
+
+        print("\n📊 New Candle Closed")
+        print(f"Price: {last['close']}")
+        print(f"EMA: {last['EMA']}")
+        print(f"VWAP: {last['VWAP']}")
+        print(f"RSI: {last['RSI']}")
+
+        execute_trade(df)
+
+    except Exception as e:
+        print("❌ Error in on_message:", e)
+
+def on_error(ws, error):
+    print("❌ WebSocket Error:", error)
+
+def on_close(ws, close_status_code, close_msg):
+    print("🔌 WebSocket Closed → Reconnecting...")
+
+def on_open(ws):
+    print("✅ WebSocket Connected")
 
 # =============================
-# WEBSOCKET START
+# WEBSOCKET START (RECONNECT FIX)
 # =============================
 def start_ws():
     url = f"wss://fstream.binance.com/ws/{SYMBOL}@kline_5m"
-    ws = WebSocketApp(url, on_message=on_message)
-    ws.run_forever()
+
+    while True:
+        try:
+            ws = WebSocketApp(
+                url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                on_open=on_open
+            )
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
+
+        except Exception as e:
+            print("❌ WS Crash:", e)
+
+        print("🔁 Reconnecting in 5 sec...")
+        time.sleep(5)
 
 # =============================
 # START
@@ -231,6 +268,5 @@ def start_ws():
 if __name__ == "__main__":
     print("🚀 WebSocket Bot Started")
 
-    load_history()   # 🔥 critical fix
-
+    load_history()
     start_ws()
