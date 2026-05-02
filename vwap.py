@@ -1,12 +1,11 @@
 import os
 import time
 import math
-import json
 import pandas as pd
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from binance.client import Client
-from websocket import WebSocketApp
+from binance import ThreadedWebsocketManager
 
 # =============================
 # CONFIG
@@ -108,7 +107,6 @@ def execute_trade(df):
         print("Position exists", flush=True)
         return
 
-    # SIGNAL (UNCHANGED)
     if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
         side = "LONG"
     elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
@@ -121,10 +119,10 @@ def execute_trade(df):
     qty = round_qty((balance * RISK_PERCENT * LEVERAGE) / price)
     notional = qty * price
 
-    print(f"Balance: {balance}, Qty: {qty}, Notional: {notional}", flush=True)
+    print(f"Balance: {balance}, Qty: {qty}", flush=True)
 
     if qty < F["min_qty"] or notional < F["min_notional"]:
-        print("❌ Qty too small → Skipping", flush=True)
+        print("❌ Qty too small", flush=True)
         return
 
     order = client.futures_create_order(
@@ -134,21 +132,16 @@ def execute_trade(df):
         quantity=qty
     )
 
-    avg = float(order.get("avgPrice", 0)) or price
-    print(f"✅ {side} @ {avg}", flush=True)
+    print(f"✅ {side} executed", flush=True)
 
 # =============================
-# DATA STORAGE
+# DATA
 # =============================
 df = pd.DataFrame(columns=["open","high","low","close","volume"])
 
-# =============================
-# LOAD HISTORICAL DATA
-# =============================
 def load_history():
     global df
-
-    print("Loading historical data...", flush=True)
+    print("Loading historical...", flush=True)
 
     klines = client.futures_klines(
         symbol=SYMBOL_UPPER,
@@ -173,92 +166,60 @@ def load_history():
     df["ATR"] = atr(df, ATR_PERIOD)
     df["VWAP"] = vwap(df)
 
-    print("✅ Historical loaded:", len(df), flush=True)
+    print("✅ History loaded", flush=True)
 
 # =============================
-# WEBSOCKET HANDLER (FIXED)
+# SOCKET CALLBACK (FIXED)
 # =============================
-def on_message(ws, message):
+def handle_socket(msg):
     global df
 
-    try:
-        msg = json.loads(message)
+    if msg['e'] != 'kline':
+        return
 
-        if "data" not in msg:
-            return
+    k = msg['k']
 
-        k = msg["data"]["k"]
+    print(f"📡 Tick: {k['c']} | Closed: {k['x']}", flush=True)
 
-        # 🔹 HEARTBEAT
-        print(f"📡 Tick: {k['c']} | Closed: {k['x']}", flush=True)
+    if not k['x']:
+        return
 
-        if not k['x']:
-            return
+    new_row = {
+        "open": float(k['o']),
+        "high": float(k['h']),
+        "low": float(k['l']),
+        "close": float(k['c']),
+        "volume": float(k['v'])
+    }
 
-        new_row = {
-            "open": float(k['o']),
-            "high": float(k['h']),
-            "low": float(k['l']),
-            "close": float(k['c']),
-            "volume": float(k['v'])
-        }
+    df = pd.concat([df, pd.DataFrame([new_row])]).tail(300)
 
-        df = pd.concat([df, pd.DataFrame([new_row])]).tail(300)
+    df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
+    df["RSI"] = rsi(df["close"], RSI_PERIOD)
+    df["ATR"] = atr(df, ATR_PERIOD)
+    df["VWAP"] = vwap(df)
 
-        df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
-        df["RSI"] = rsi(df["close"], RSI_PERIOD)
-        df["ATR"] = atr(df, ATR_PERIOD)
-        df["VWAP"] = vwap(df)
+    print("📊 Candle closed", flush=True)
 
-        last = df.iloc[-1]
-
-        print("\n📊 Candle Closed", flush=True)
-        print(f"Price: {last['close']}", flush=True)
-        print(f"EMA: {last['EMA']}", flush=True)
-        print(f"VWAP: {last['VWAP']}", flush=True)
-        print(f"RSI: {last['RSI']}", flush=True)
-
-        execute_trade(df)
-
-    except Exception as e:
-        print("❌ Error:", e, flush=True)
-
-def on_open(ws):
-    print("✅ WebSocket Connected", flush=True)
-
-def on_error(ws, error):
-    print("❌ WS Error:", error, flush=True)
-
-def on_close(ws, a, b):
-    print("🔌 WS Closed → Reconnecting...", flush=True)
+    execute_trade(df)
 
 # =============================
-# START WS (FIXED)
+# START SOCKET (FINAL FIX)
 # =============================
-def start_ws():
-    stream = f"{SYMBOL}@kline_5m"
-    url = f"wss://fstream.binance.com/stream?streams={stream}"
+def start_socket():
+    twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+    twm.start()
+
+    print("✅ Socket Started", flush=True)
+
+    twm.start_kline_socket(
+        callback=handle_socket,
+        symbol=SYMBOL_UPPER,
+        interval="5m"
+    )
 
     while True:
-        try:
-            ws = WebSocketApp(
-                url,
-                on_message=on_message,
-                on_open=on_open,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            ws.run_forever(
-                ping_interval=20,
-                ping_timeout=10
-            )
-
-        except Exception as e:
-            print("❌ WS Crash:", e, flush=True)
-
-        print("🔁 Reconnecting in 5 sec...", flush=True)
-        time.sleep(5)
+        time.sleep(1)
 
 # =============================
 # MAIN
@@ -267,4 +228,4 @@ if __name__ == "__main__":
     print("🚀 Bot Started", flush=True)
 
     load_history()
-    start_ws()
+    start_socket()
