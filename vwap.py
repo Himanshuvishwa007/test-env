@@ -26,6 +26,11 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 VWAP_WINDOW = 288
 
+TP_MULT = 1.5
+SL_MULT = 1.0
+
+TRADE_LOG_FILE = "trades.csv"
+
 client = Client(API_KEY, API_SECRET)
 
 # =============================
@@ -38,8 +43,8 @@ def get_filters():
             f = {x["filterType"]: x for x in s["filters"]}
             return {
                 "step": float(f["LOT_SIZE"]["stepSize"]),
-                "min_qty": float(f["LOT_SIZE"]["minQty"]),
-                "min_notional": float(f["MIN_NOTIONAL"]["notional"])
+                "tick": float(f["PRICE_FILTER"]["tickSize"]),
+                "min_qty": float(f["LOT_SIZE"]["minQty"])
             }
 
 F = get_filters()
@@ -48,15 +53,9 @@ def round_qty(q):
     q = math.floor(q / F["step"]) * F["step"]
     return float(Decimal(str(q)).quantize(Decimal(str(F["step"])), ROUND_DOWN))
 
-# =============================
-# BALANCE
-# =============================
-def get_balance():
-    balances = client.futures_account_balance()
-    for b in balances:
-        if b["asset"] == "USDT":
-            return float(b["balance"])
-    return 0
+def round_price(p):
+    step = F["tick"]
+    return float(Decimal(str(p)).quantize(Decimal(str(step)), ROUND_DOWN))
 
 # =============================
 # INDICATORS
@@ -82,8 +81,26 @@ def vwap(df):
     return pv / vol
 
 # =============================
-# POSITION CHECK
+# GLOBAL STATE
 # =============================
+df = pd.DataFrame()
+current_trade = {
+    "side": None,
+    "entry": None,
+    "sl_id": None,
+    "tp_id": None
+}
+
+# =============================
+# BALANCE
+# =============================
+def get_balance():
+    balances = client.futures_account_balance()
+    for b in balances:
+        if b["asset"] == "USDT":
+            return float(b["balance"])
+    return 0
+
 def has_position():
     pos = client.futures_position_information(symbol=SYMBOL_UPPER)
     for p in pos:
@@ -92,19 +109,28 @@ def has_position():
     return False
 
 # =============================
-# ORDER EXECUTION
+# LOGGING
+# =============================
+def log_trade(entry, exit_price, side):
+    pnl = (exit_price - entry) if side == "LONG" else (entry - exit_price)
+    with open(TRADE_LOG_FILE, "a") as f:
+        f.write(f"{time.time()},{side},{entry},{exit_price},{pnl}\n")
+    print(f"📊 PnL: {pnl}", flush=True)
+
+# =============================
+# EXECUTE TRADE
 # =============================
 def execute_trade(df):
+    global current_trade
 
-    if len(df) < 250:
-        print("Waiting for enough data...", flush=True)
+    if current_trade["side"] is not None:
         return
 
     last = df.iloc[-1]
     price = last["close"]
+    atr_val = last["ATR"]
 
     if has_position():
-        print("Position exists", flush=True)
         return
 
     if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
@@ -117,37 +143,95 @@ def execute_trade(df):
 
     balance = get_balance()
     qty = round_qty((balance * RISK_PERCENT * LEVERAGE) / price)
-    notional = qty * price
 
-    print(f"Balance: {balance}, Qty: {qty}", flush=True)
-
-    if qty < F["min_qty"] or notional < F["min_notional"]:
-        print("❌ Qty too small", flush=True)
+    if qty < F["min_qty"]:
+        print("Qty too small", flush=True)
         return
 
-    order = client.futures_create_order(
+    entry_order = client.futures_create_order(
         symbol=SYMBOL_UPPER,
-        side="BUY" if side=="LONG" else "SELL",
+        side="BUY" if side == "LONG" else "SELL",
         type="MARKET",
         quantity=qty
     )
 
-    print(f"✅ {side} executed", flush=True)
+    entry = float(entry_order.get("avgPrice", 0)) or price
+
+    if side == "LONG":
+        sl = round_price(entry - atr_val * SL_MULT)
+        tp = round_price(entry + atr_val * TP_MULT)
+        exit_side = "SELL"
+    else:
+        sl = round_price(entry + atr_val * SL_MULT)
+        tp = round_price(entry - atr_val * TP_MULT)
+        exit_side = "BUY"
+
+    sl_order = client.futures_create_order(
+        symbol=SYMBOL_UPPER,
+        side=exit_side,
+        type="STOP_MARKET",
+        stopPrice=sl,
+        closePosition=True
+    )
+
+    tp_order = client.futures_create_order(
+        symbol=SYMBOL_UPPER,
+        side=exit_side,
+        type="TAKE_PROFIT_MARKET",
+        stopPrice=tp,
+        closePosition=True
+    )
+
+    current_trade = {
+        "side": side,
+        "entry": entry,
+        "sl_id": sl_order["orderId"],
+        "tp_id": tp_order["orderId"]
+    }
+
+    print(f"✅ {side} ENTRY @ {entry} | SL {sl} | TP {tp}", flush=True)
 
 # =============================
-# DATA
+# MONITOR ORDERS
 # =============================
-df = pd.DataFrame(columns=["open","high","low","close","volume"])
+def monitor_orders():
+    global current_trade
 
+    if current_trade["side"] is None:
+        return
+
+    orders = client.futures_get_open_orders(symbol=SYMBOL_UPPER)
+    open_ids = [o["orderId"] for o in orders]
+
+    sl_alive = current_trade["sl_id"] in open_ids
+    tp_alive = current_trade["tp_id"] in open_ids
+
+    if not sl_alive or not tp_alive:
+        print("🎯 Trade closed", flush=True)
+
+        for o in orders:
+            if o["orderId"] in [current_trade["sl_id"], current_trade["tp_id"]]:
+                client.futures_cancel_order(symbol=SYMBOL_UPPER, orderId=o["orderId"])
+
+        mark = client.futures_mark_price(symbol=SYMBOL_UPPER)
+        exit_price = float(mark["markPrice"])
+
+        log_trade(current_trade["entry"], exit_price, current_trade["side"])
+
+        current_trade = {
+            "side": None,
+            "entry": None,
+            "sl_id": None,
+            "tp_id": None
+        }
+
+# =============================
+# LOAD HISTORY
+# =============================
 def load_history():
     global df
-    print("Loading historical...", flush=True)
 
-    klines = client.futures_klines(
-        symbol=SYMBOL_UPPER,
-        interval="5m",
-        limit=300
-    )
+    klines = client.futures_klines(symbol=SYMBOL_UPPER, interval="5m", limit=300)
 
     data = []
     for k in klines:
@@ -166,10 +250,8 @@ def load_history():
     df["ATR"] = atr(df, ATR_PERIOD)
     df["VWAP"] = vwap(df)
 
-    print("✅ History loaded", flush=True)
-
 # =============================
-# SOCKET CALLBACK (FIXED)
+# SOCKET
 # =============================
 def handle_socket(msg):
     global df
@@ -179,7 +261,7 @@ def handle_socket(msg):
 
     k = msg['k']
 
-    print(f"📡 Tick: {k['c']} | Closed: {k['x']}", flush=True)
+    print(f"📡 {k['c']} | Closed: {k['x']}", flush=True)
 
     if not k['x']:
         return
@@ -199,27 +281,7 @@ def handle_socket(msg):
     df["ATR"] = atr(df, ATR_PERIOD)
     df["VWAP"] = vwap(df)
 
-    print("📊 Candle closed", flush=True)
-
     execute_trade(df)
-
-# =============================
-# START SOCKET (FINAL FIX)
-# =============================
-def start_socket():
-    twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
-    twm.start()
-
-    print("✅ Socket Started", flush=True)
-
-    twm.start_kline_socket(
-        callback=handle_socket,
-        symbol=SYMBOL_UPPER,
-        interval="5m"
-    )
-
-    while True:
-        time.sleep(1)
 
 # =============================
 # MAIN
@@ -228,4 +290,16 @@ if __name__ == "__main__":
     print("🚀 Bot Started", flush=True)
 
     load_history()
-    start_socket()
+
+    twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+    twm.start()
+
+    twm.start_kline_socket(
+        callback=handle_socket,
+        symbol=SYMBOL_UPPER,
+        interval="5m"
+    )
+
+    while True:
+        monitor_orders()
+        time.sleep(2)
