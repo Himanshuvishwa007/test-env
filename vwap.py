@@ -2,7 +2,6 @@ import os
 import time
 import math
 import json
-import threading
 import pandas as pd
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
@@ -17,7 +16,7 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_LIVE_API_KEY")
 API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 
-SYMBOL = "ethusdt"   # lowercase for websocket
+SYMBOL = "ethusdt"
 SYMBOL_UPPER = "ETHUSDT"
 
 LEVERAGE = 2
@@ -46,6 +45,7 @@ def get_filters():
                 "min_qty": float(f["LOT_SIZE"]["minQty"]),
                 "min_notional": float(f["MIN_NOTIONAL"]["notional"])
             }
+
 F = get_filters()
 
 def round_qty(q):
@@ -101,6 +101,7 @@ def has_position():
 def execute_trade(df):
 
     if len(df) < 250:
+        print("Waiting for enough data...")
         return
 
     last = df.iloc[-1]
@@ -145,6 +146,40 @@ def execute_trade(df):
 df = pd.DataFrame(columns=["open","high","low","close","volume"])
 
 # =============================
+# LOAD HISTORICAL DATA (FIX)
+# =============================
+def load_history():
+    global df
+
+    print("Loading historical data...")
+
+    klines = client.futures_klines(
+        symbol=SYMBOL_UPPER,
+        interval="5m",
+        limit=300
+    )
+
+    data = []
+    for k in klines:
+        data.append({
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5])
+        })
+
+    df = pd.DataFrame(data)
+
+    # indicators (UNCHANGED LOGIC)
+    df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
+    df["RSI"] = rsi(df["close"], RSI_PERIOD)
+    df["ATR"] = atr(df, ATR_PERIOD)
+    df["VWAP"] = vwap(df)
+
+    print("✅ Historical loaded:", len(df))
+
+# =============================
 # WEBSOCKET HANDLER
 # =============================
 def on_message(ws, message):
@@ -153,10 +188,8 @@ def on_message(ws, message):
     msg = json.loads(message)
     k = msg['k']
 
-    is_closed = k['x']
-
-    if not is_closed:
-        return  # only act on candle close
+    if not k['x']:
+        return  # only closed candle
 
     new_row = {
         "open": float(k['o']),
@@ -168,13 +201,19 @@ def on_message(ws, message):
 
     df = pd.concat([df, pd.DataFrame([new_row])]).tail(300)
 
-    # indicators
+    # indicators (UNCHANGED)
     df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
     df["RSI"] = rsi(df["close"], RSI_PERIOD)
     df["ATR"] = atr(df, ATR_PERIOD)
     df["VWAP"] = vwap(df)
 
-    print("New candle closed")
+    last = df.iloc[-1]
+
+    print("\n📊 New Candle Closed")
+    print(f"Price: {last['close']}")
+    print(f"EMA: {last['EMA']}")
+    print(f"VWAP: {last['VWAP']}")
+    print(f"RSI: {last['RSI']}")
 
     execute_trade(df)
 
@@ -191,4 +230,7 @@ def start_ws():
 # =============================
 if __name__ == "__main__":
     print("🚀 WebSocket Bot Started")
+
+    load_history()   # 🔥 critical fix
+
     start_ws()
