@@ -27,9 +27,6 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 VWAP_WINDOW = 288
 
-TP_MULT = 1.5
-SL_MULT = 1.0
-
 client = Client(API_KEY, API_SECRET)
 
 # =============================
@@ -101,14 +98,14 @@ def has_position():
 def execute_trade(df):
 
     if len(df) < 250:
-        print("Waiting for enough data...")
+        print("Waiting for enough data...", flush=True)
         return
 
     last = df.iloc[-1]
     price = last["close"]
 
     if has_position():
-        print("Position exists")
+        print("Position exists", flush=True)
         return
 
     # SIGNAL (UNCHANGED)
@@ -117,17 +114,17 @@ def execute_trade(df):
     elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
         side = "SHORT"
     else:
-        print("No signal")
+        print("No signal", flush=True)
         return
 
     balance = get_balance()
     qty = round_qty((balance * RISK_PERCENT * LEVERAGE) / price)
     notional = qty * price
 
-    print(f"Balance: {balance}, Qty: {qty}, Notional: {notional}")
+    print(f"Balance: {balance}, Qty: {qty}, Notional: {notional}", flush=True)
 
     if qty < F["min_qty"] or notional < F["min_notional"]:
-        print("❌ Qty too small → Skipping")
+        print("❌ Qty too small → Skipping", flush=True)
         return
 
     order = client.futures_create_order(
@@ -138,7 +135,7 @@ def execute_trade(df):
     )
 
     avg = float(order.get("avgPrice", 0)) or price
-    print(f"✅ {side} @ {avg}")
+    print(f"✅ {side} @ {avg}", flush=True)
 
 # =============================
 # DATA STORAGE
@@ -151,7 +148,7 @@ df = pd.DataFrame(columns=["open","high","low","close","volume"])
 def load_history():
     global df
 
-    print("Loading historical data...")
+    print("Loading historical data...", flush=True)
 
     klines = client.futures_klines(
         symbol=SYMBOL_UPPER,
@@ -176,7 +173,7 @@ def load_history():
     df["ATR"] = atr(df, ATR_PERIOD)
     df["VWAP"] = vwap(df)
 
-    print("✅ Historical loaded:", len(df))
+    print("✅ Historical loaded:", len(df), flush=True)
 
 # =============================
 # WEBSOCKET HANDLER (FIXED)
@@ -187,13 +184,13 @@ def on_message(ws, message):
     try:
         msg = json.loads(message)
 
-        if 'k' not in msg:
+        if "data" not in msg:
             return
 
-        k = msg['k']
+        k = msg["data"]["k"]
 
         # 🔹 HEARTBEAT
-        print(f"📡 Live Tick: {k['c']} | Closed: {k['x']}")
+        print(f"📡 Tick: {k['c']} | Closed: {k['x']}", flush=True)
 
         if not k['x']:
             return
@@ -215,40 +212,41 @@ def on_message(ws, message):
 
         last = df.iloc[-1]
 
-        print("\n📊 New Candle Closed")
-        print(f"Price: {last['close']}")
-        print(f"EMA: {last['EMA']}")
-        print(f"VWAP: {last['VWAP']}")
-        print(f"RSI: {last['RSI']}")
+        print("\n📊 Candle Closed", flush=True)
+        print(f"Price: {last['close']}", flush=True)
+        print(f"EMA: {last['EMA']}", flush=True)
+        print(f"VWAP: {last['VWAP']}", flush=True)
+        print(f"RSI: {last['RSI']}", flush=True)
 
         execute_trade(df)
 
     except Exception as e:
-        print("❌ Error in on_message:", e)
-
-def on_error(ws, error):
-    print("❌ WebSocket Error:", error)
-
-def on_close(ws, close_status_code, close_msg):
-    print("🔌 WebSocket Closed → Reconnecting...")
+        print("❌ Error:", e, flush=True)
 
 def on_open(ws):
-    print("✅ WebSocket Connected")
+    print("✅ WebSocket Connected", flush=True)
+
+def on_error(ws, error):
+    print("❌ WS Error:", error, flush=True)
+
+def on_close(ws, a, b):
+    print("🔌 WS Closed → Reconnecting...", flush=True)
 
 # =============================
-# WEBSOCKET START (RECONNECT FIX)
+# START WS (FIXED)
 # =============================
 def start_ws():
-    url = f"wss://fstream.binance.com/ws/{SYMBOL}@kline_5m"
+    stream = f"{SYMBOL}@kline_5m"
+    url = f"wss://fstream.binance.com/stream?streams={stream}"
 
     while True:
         try:
             ws = WebSocketApp(
                 url,
                 on_message=on_message,
+                on_open=on_open,
                 on_error=on_error,
-                on_close=on_close,
-                on_open=on_open
+                on_close=on_close
             )
 
             ws.run_forever(
@@ -257,16 +255,16 @@ def start_ws():
             )
 
         except Exception as e:
-            print("❌ WS Crash:", e)
+            print("❌ WS Crash:", e, flush=True)
 
-        print("🔁 Reconnecting in 5 sec...")
+        print("🔁 Reconnecting in 5 sec...", flush=True)
         time.sleep(5)
 
 # =============================
-# START
+# MAIN
 # =============================
 if __name__ == "__main__":
-    print("🚀 WebSocket Bot Started")
+    print("🚀 Bot Started", flush=True)
 
     load_history()
     start_ws()
