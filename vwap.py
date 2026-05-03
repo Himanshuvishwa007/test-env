@@ -1,11 +1,11 @@
 import os
 import time
 import math
-import pandas as pd
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from binance.client import Client
 from binance import ThreadedWebsocketManager
+from collections import deque
 
 # =============================
 # CONFIG
@@ -58,38 +58,22 @@ def round_price(p):
     return float(Decimal(str(p)).quantize(Decimal(str(step)), ROUND_DOWN))
 
 # =============================
-# INDICATORS
-# =============================
-def rsi(series, period):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    rs = gain.rolling(period).mean() / loss.rolling(period).mean()
-    return 100 - (100/(1+rs))
-
-def atr(df, period):
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-def vwap(df):
-    pv = (df["close"] * df["volume"]).rolling(VWAP_WINDOW).sum()
-    vol = df["volume"].rolling(VWAP_WINDOW).sum()
-    return pv / vol
-
-# =============================
 # GLOBAL STATE
 # =============================
-df = pd.DataFrame()
-current_trade = {
-    "side": None,
-    "entry": None,
-    "sl_id": None,
-    "tp_id": None
-}
+current_trade = {"side": None, "entry": None, "sl_id": None, "tp_id": None}
+
+# Incremental indicator state
+prev_close = None
+ema = None
+alpha = 2 / (EMA_TREND + 1)
+
+atr = None
+rsi_avg_gain = None
+rsi_avg_loss = None
+
+vwap_queue = deque(maxlen=VWAP_WINDOW)
+vwap_pv_sum = 0
+vwap_vol_sum = 0
 
 # =============================
 # BALANCE
@@ -118,24 +102,118 @@ def log_trade(entry, exit_price, side):
     print(f"📊 PnL: {pnl}", flush=True)
 
 # =============================
+# LOAD HISTORY + INIT
+# =============================
+def load_history():
+    global prev_close, ema, atr, rsi_avg_gain, rsi_avg_loss
+    global vwap_pv_sum, vwap_vol_sum
+
+    klines = client.futures_klines(symbol=SYMBOL_UPPER, interval="5m", limit=300)
+
+    closes, highs, lows, volumes = [], [], [], []
+
+    for k in klines:
+        closes.append(float(k[4]))
+        highs.append(float(k[2]))
+        lows.append(float(k[3]))
+        volumes.append(float(k[5]))
+
+    # EMA init
+    ema_series = closes[0]
+    for c in closes:
+        ema_series = (c - ema_series) * alpha + ema_series
+    ema = ema_series
+
+    # ATR init
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i] - closes[i-1])
+        )
+        tr_list.append(tr)
+    atr = sum(tr_list[-ATR_PERIOD:]) / ATR_PERIOD
+
+    # RSI init
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+
+    rsi_avg_gain = sum(gains[-RSI_PERIOD:]) / RSI_PERIOD
+    rsi_avg_loss = sum(losses[-RSI_PERIOD:]) / RSI_PERIOD
+
+    # VWAP init
+    for i in range(len(closes)):
+        pv = closes[i] * volumes[i]
+        vwap_queue.append((pv, volumes[i]))
+        vwap_pv_sum += pv
+        vwap_vol_sum += volumes[i]
+
+    prev_close = closes[-1]
+
+# =============================
+# UPDATE INDICATORS
+# =============================
+def update_indicators(candle):
+    global ema, atr, rsi_avg_gain, rsi_avg_loss, prev_close
+    global vwap_pv_sum, vwap_vol_sum
+
+    high, low, close, volume = candle["high"], candle["low"], candle["close"], candle["volume"]
+
+    # EMA
+    ema = (close - ema) * alpha + ema
+
+    # ATR
+    tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+    atr = ((atr * (ATR_PERIOD - 1)) + tr) / ATR_PERIOD
+
+    # RSI
+    change = close - prev_close
+    gain = max(change, 0)
+    loss = max(-change, 0)
+
+    rsi_avg_gain = ((rsi_avg_gain * (RSI_PERIOD - 1)) + gain) / RSI_PERIOD
+    rsi_avg_loss = ((rsi_avg_loss * (RSI_PERIOD - 1)) + loss) / RSI_PERIOD
+
+    rs = rsi_avg_gain / rsi_avg_loss if rsi_avg_loss != 0 else 0
+    rsi = 100 - (100 / (1 + rs))
+
+    # VWAP
+    pv = close * volume
+    if len(vwap_queue) == VWAP_WINDOW:
+        old_pv, old_vol = vwap_queue.popleft()
+        vwap_pv_sum -= old_pv
+        vwap_vol_sum -= old_vol
+
+    vwap_queue.append((pv, volume))
+    vwap_pv_sum += pv
+    vwap_vol_sum += volume
+    vwap_val = vwap_pv_sum / vwap_vol_sum if vwap_vol_sum != 0 else close
+
+    prev_close = close
+
+    return {"EMA": ema, "ATR": atr, "RSI": rsi, "VWAP": vwap_val, "close": close}
+
+# =============================
 # EXECUTE TRADE
 # =============================
-def execute_trade(df):
+def execute_trade(ind):
     global current_trade
 
     if current_trade["side"] is not None:
         return
 
-    last = df.iloc[-1]
-    price = last["close"]
-    atr_val = last["ATR"]
+    price, atr_val = ind["close"], ind["ATR"]
 
     if has_position():
         return
 
-    if price > last["EMA"] and price < last["VWAP"] * 1.002 and last["RSI"] < 45:
+    if price > ind["EMA"] and price < ind["VWAP"] * 1.002 and ind["RSI"] < 45:
         side = "LONG"
-    elif price < last["EMA"] and price > last["VWAP"] * 0.998 and last["RSI"] > 55:
+    elif price < ind["EMA"] and price > ind["VWAP"] * 0.998 and ind["RSI"] > 55:
         side = "SHORT"
     else:
         print("No signal", flush=True)
@@ -182,91 +260,22 @@ def execute_trade(df):
         closePosition=True
     )
 
-    current_trade = {
-        "side": side,
-        "entry": entry,
-        "sl_id": sl_order["orderId"],
-        "tp_id": tp_order["orderId"]
-    }
+    current_trade = {"side": side, "entry": entry, "sl_id": sl_order["orderId"], "tp_id": tp_order["orderId"]}
 
     print(f"✅ {side} ENTRY @ {entry} | SL {sl} | TP {tp}", flush=True)
-
-# =============================
-# MONITOR ORDERS
-# =============================
-def monitor_orders():
-    global current_trade
-
-    if current_trade["side"] is None:
-        return
-
-    orders = client.futures_get_open_orders(symbol=SYMBOL_UPPER)
-    open_ids = [o["orderId"] for o in orders]
-
-    sl_alive = current_trade["sl_id"] in open_ids
-    tp_alive = current_trade["tp_id"] in open_ids
-
-    if not sl_alive or not tp_alive:
-        print("🎯 Trade closed", flush=True)
-
-        for o in orders:
-            if o["orderId"] in [current_trade["sl_id"], current_trade["tp_id"]]:
-                client.futures_cancel_order(symbol=SYMBOL_UPPER, orderId=o["orderId"])
-
-        mark = client.futures_mark_price(symbol=SYMBOL_UPPER)
-        exit_price = float(mark["markPrice"])
-
-        log_trade(current_trade["entry"], exit_price, current_trade["side"])
-
-        current_trade = {
-            "side": None,
-            "entry": None,
-            "sl_id": None,
-            "tp_id": None
-        }
-
-# =============================
-# LOAD HISTORY
-# =============================
-def load_history():
-    global df
-
-    klines = client.futures_klines(symbol=SYMBOL_UPPER, interval="5m", limit=300)
-
-    data = []
-    for k in klines:
-        data.append({
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5])
-        })
-
-    df = pd.DataFrame(data)
-
-    df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
-    df["RSI"] = rsi(df["close"], RSI_PERIOD)
-    df["ATR"] = atr(df, ATR_PERIOD)
-    df["VWAP"] = vwap(df)
 
 # =============================
 # SOCKET
 # =============================
 def handle_socket(msg):
-    global df
-
     if msg['e'] != 'kline':
         return
 
     k = msg['k']
-
-    print(f"📡 {k['c']} | Closed: {k['x']}", flush=True)
-
     if not k['x']:
         return
 
-    new_row = {
+    candle = {
         "open": float(k['o']),
         "high": float(k['h']),
         "low": float(k['l']),
@@ -274,14 +283,11 @@ def handle_socket(msg):
         "volume": float(k['v'])
     }
 
-    df = pd.concat([df, pd.DataFrame([new_row])]).tail(300)
+    ind = update_indicators(candle)
 
-    df["EMA"] = df["close"].ewm(span=EMA_TREND).mean()
-    df["RSI"] = rsi(df["close"], RSI_PERIOD)
-    df["ATR"] = atr(df, ATR_PERIOD)
-    df["VWAP"] = vwap(df)
+    print(f"📡 Close: {ind['close']} | RSI: {ind['RSI']:.2f}", flush=True)
 
-    execute_trade(df)
+    execute_trade(ind)
 
 # =============================
 # MAIN
@@ -301,5 +307,4 @@ if __name__ == "__main__":
     )
 
     while True:
-        monitor_orders()
         time.sleep(2)
