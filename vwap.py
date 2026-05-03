@@ -30,8 +30,20 @@ TP_MULT = 1.5
 SL_MULT = 1.0
 
 TRADE_LOG_FILE = "trades.csv"
+ERROR_LOG_FILE = "error.log"
 
 client = Client(API_KEY, API_SECRET)
+
+# =============================
+# LOGGING
+# =============================
+def log_error(msg):
+    with open(ERROR_LOG_FILE, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | ERROR | {msg}\n")
+
+def log_decision(msg):
+    with open(ERROR_LOG_FILE, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | DECISION | {msg}\n")
 
 # =============================
 # FILTERS
@@ -62,7 +74,6 @@ def round_price(p):
 # =============================
 current_trade = {"side": None, "entry": None, "sl_id": None, "tp_id": None}
 
-# Incremental indicator state
 prev_close = None
 ema = None
 alpha = 2 / (EMA_TREND + 1)
@@ -79,30 +90,35 @@ vwap_vol_sum = 0
 # BALANCE
 # =============================
 def get_balance():
-    balances = client.futures_account_balance()
-    for b in balances:
-        if b["asset"] == "USDT":
-            return float(b["balance"])
+    try:
+        balances = client.futures_account_balance()
+        for b in balances:
+            if b["asset"] == "USDT":
+                return float(b["balance"])
+    except Exception as e:
+        log_error(f"Balance fetch error: {str(e)}")
     return 0
 
 def has_position():
-    pos = client.futures_position_information(symbol=SYMBOL_UPPER)
-    for p in pos:
-        if float(p["positionAmt"]) != 0:
-            return True
+    try:
+        pos = client.futures_position_information(symbol=SYMBOL_UPPER)
+        for p in pos:
+            if float(p["positionAmt"]) != 0:
+                return True
+    except Exception as e:
+        log_error(f"Position check error: {str(e)}")
     return False
 
 # =============================
-# LOGGING
+# TRADE LOG
 # =============================
 def log_trade(entry, exit_price, side):
     pnl = (exit_price - entry) if side == "LONG" else (entry - exit_price)
     with open(TRADE_LOG_FILE, "a") as f:
         f.write(f"{time.time()},{side},{entry},{exit_price},{pnl}\n")
-    print(f"📊 PnL: {pnl}", flush=True)
 
 # =============================
-# LOAD HISTORY + INIT
+# LOAD HISTORY
 # =============================
 def load_history():
     global prev_close, ema, atr, rsi_avg_gain, rsi_avg_loss
@@ -118,13 +134,13 @@ def load_history():
         lows.append(float(k[3]))
         volumes.append(float(k[5]))
 
-    # EMA init
+    # EMA
     ema_series = closes[0]
     for c in closes:
         ema_series = (c - ema_series) * alpha + ema_series
     ema = ema_series
 
-    # ATR init
+    # ATR
     tr_list = []
     for i in range(1, len(closes)):
         tr = max(
@@ -135,7 +151,7 @@ def load_history():
         tr_list.append(tr)
     atr = sum(tr_list[-ATR_PERIOD:]) / ATR_PERIOD
 
-    # RSI init
+    # RSI
     gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
@@ -145,7 +161,7 @@ def load_history():
     rsi_avg_gain = sum(gains[-RSI_PERIOD:]) / RSI_PERIOD
     rsi_avg_loss = sum(losses[-RSI_PERIOD:]) / RSI_PERIOD
 
-    # VWAP init
+    # VWAP
     for i in range(len(closes)):
         pv = closes[i] * volumes[i]
         vwap_queue.append((pv, volumes[i]))
@@ -191,6 +207,7 @@ def update_indicators(candle):
     vwap_queue.append((pv, volume))
     vwap_pv_sum += pv
     vwap_vol_sum += volume
+
     vwap_val = vwap_pv_sum / vwap_vol_sum if vwap_vol_sum != 0 else close
 
     prev_close = close
@@ -203,97 +220,116 @@ def update_indicators(candle):
 def execute_trade(ind):
     global current_trade
 
-    if current_trade["side"] is not None:
-        return
+    try:
+        if current_trade["side"] is not None:
+            log_decision("Skipped: already in trade (local)")
+            return
 
-    price, atr_val = ind["close"], ind["ATR"]
+        if has_position():
+            log_decision("Skipped: existing Binance position")
+            return
 
-    if has_position():
-        return
+        price = ind["close"]
+        atr_val = ind["ATR"]
 
-    if price > ind["EMA"] and price < ind["VWAP"] * 1.002 and ind["RSI"] < 45:
-        side = "LONG"
-    elif price < ind["EMA"] and price > ind["VWAP"] * 0.998 and ind["RSI"] > 55:
-        side = "SHORT"
-    else:
-        print("No signal", flush=True)
-        return
+        long_cond = price > ind["EMA"] and price < ind["VWAP"] * 1.002 and ind["RSI"] < 45
+        short_cond = price < ind["EMA"] and price > ind["VWAP"] * 0.998 and ind["RSI"] > 55
 
-    balance = get_balance()
-    qty = round_qty((balance * RISK_PERCENT * LEVERAGE) / price)
+        if long_cond:
+            side = "LONG"
+        elif short_cond:
+            side = "SHORT"
+        else:
+            log_decision(f"No signal | Price:{price} RSI:{ind['RSI']:.2f}")
+            return
 
-    if qty < F["min_qty"]:
-        print("Qty too small", flush=True)
-        return
+        balance = get_balance()
+        qty = round_qty((balance * RISK_PERCENT * LEVERAGE) / price)
 
-    entry_order = client.futures_create_order(
-        symbol=SYMBOL_UPPER,
-        side="BUY" if side == "LONG" else "SELL",
-        type="MARKET",
-        quantity=qty
-    )
+        if qty < F["min_qty"]:
+            log_error(f"Qty too small: {qty}")
+            return
 
-    entry = float(entry_order.get("avgPrice", 0)) or price
+        entry_order = client.futures_create_order(
+            symbol=SYMBOL_UPPER,
+            side="BUY" if side == "LONG" else "SELL",
+            type="MARKET",
+            quantity=qty
+        )
 
-    if side == "LONG":
-        sl = round_price(entry - atr_val * SL_MULT)
-        tp = round_price(entry + atr_val * TP_MULT)
-        exit_side = "SELL"
-    else:
-        sl = round_price(entry + atr_val * SL_MULT)
-        tp = round_price(entry - atr_val * TP_MULT)
-        exit_side = "BUY"
+        entry = float(entry_order.get("avgPrice", 0)) or price
 
-    sl_order = client.futures_create_order(
-        symbol=SYMBOL_UPPER,
-        side=exit_side,
-        type="STOP_MARKET",
-        stopPrice=sl,
-        closePosition=True
-    )
+        if side == "LONG":
+            sl = round_price(entry - atr_val * SL_MULT)
+            tp = round_price(entry + atr_val * TP_MULT)
+            exit_side = "SELL"
+        else:
+            sl = round_price(entry + atr_val * SL_MULT)
+            tp = round_price(entry - atr_val * TP_MULT)
+            exit_side = "BUY"
 
-    tp_order = client.futures_create_order(
-        symbol=SYMBOL_UPPER,
-        side=exit_side,
-        type="TAKE_PROFIT_MARKET",
-        stopPrice=tp,
-        closePosition=True
-    )
+        sl_order = client.futures_create_order(
+            symbol=SYMBOL_UPPER,
+            side=exit_side,
+            type="STOP_MARKET",
+            stopPrice=sl,
+            closePosition=True
+        )
 
-    current_trade = {"side": side, "entry": entry, "sl_id": sl_order["orderId"], "tp_id": tp_order["orderId"]}
+        tp_order = client.futures_create_order(
+            symbol=SYMBOL_UPPER,
+            side=exit_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=tp,
+            closePosition=True
+        )
 
-    print(f"✅ {side} ENTRY @ {entry} | SL {sl} | TP {tp}", flush=True)
+        current_trade = {
+            "side": side,
+            "entry": entry,
+            "sl_id": sl_order["orderId"],
+            "tp_id": tp_order["orderId"]
+        }
+
+        print(f"✅ {side} ENTRY @ {entry}", flush=True)
+
+    except Exception as e:
+        log_error(f"Trade execution error: {str(e)}")
 
 # =============================
 # SOCKET
 # =============================
 def handle_socket(msg):
-    if msg['e'] != 'kline':
-        return
+    try:
+        if msg.get('e') != 'kline':
+            return
 
-    k = msg['k']
-    if not k['x']:
-        return
+        k = msg['k']
+        if not k['x']:
+            return
 
-    candle = {
-        "open": float(k['o']),
-        "high": float(k['h']),
-        "low": float(k['l']),
-        "close": float(k['c']),
-        "volume": float(k['v'])
-    }
+        candle = {
+            "open": float(k['o']),
+            "high": float(k['h']),
+            "low": float(k['l']),
+            "close": float(k['c']),
+            "volume": float(k['v'])
+        }
 
-    ind = update_indicators(candle)
+        ind = update_indicators(candle)
 
-    print(f"📡 Close: {ind['close']} | RSI: {ind['RSI']:.2f}", flush=True)
+        print(f"📡 Price: {ind['close']} RSI: {ind['RSI']:.2f}", flush=True)
 
-    execute_trade(ind)
+        execute_trade(ind)
+
+    except Exception as e:
+        log_error(f"Socket error: {str(e)}")
 
 # =============================
 # MAIN
 # =============================
 if __name__ == "__main__":
-    print("🚀 Bot Started", flush=True)
+    print("🚀 Bot Started")
 
     load_history()
 
