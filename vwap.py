@@ -18,6 +18,8 @@ API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 SYMBOL = "ethusdt"
 SYMBOL_UPPER = "ETHUSDT"
 
+INTERVAL = "1m"   # 🔥 change back to 5m after testing
+
 LEVERAGE = 2
 RISK_PERCENT = 0.3
 
@@ -29,7 +31,6 @@ VWAP_WINDOW = 51
 TP_MULT = 1.5
 SL_MULT = 1.0
 
-TRADE_LOG_FILE = "trades.csv"
 ERROR_LOG_FILE = "error.log"
 
 client = Client(API_KEY, API_SECRET)
@@ -39,11 +40,7 @@ client = Client(API_KEY, API_SECRET)
 # =============================
 def log_error(msg):
     with open(ERROR_LOG_FILE, "a") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | ERROR | {msg}\n")
-
-def log_decision(msg):
-    with open(ERROR_LOG_FILE, "a") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | DECISION | {msg}\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n")
 
 # =============================
 # FILTERS
@@ -72,8 +69,6 @@ def round_price(p):
 # =============================
 # GLOBAL STATE
 # =============================
-current_trade = {"side": None, "entry": None, "sl_id": None, "tp_id": None}
-
 prev_close = None
 ema = None
 alpha = 2 / (EMA_TREND + 1)
@@ -86,36 +81,7 @@ vwap_queue = deque(maxlen=VWAP_WINDOW)
 vwap_pv_sum = 0
 vwap_vol_sum = 0
 
-# =============================
-# BALANCE
-# =============================
-def get_balance():
-    try:
-        balances = client.futures_account_balance()
-        for b in balances:
-            if b["asset"] == "USDT":
-                return float(b["balance"])
-    except Exception as e:
-        log_error(f"Balance fetch error: {str(e)}")
-    return 0
-
-def has_position():
-    try:
-        pos = client.futures_position_information(symbol=SYMBOL_UPPER)
-        for p in pos:
-            if float(p["positionAmt"]) != 0:
-                return True
-    except Exception as e:
-        log_error(f"Position check error: {str(e)}")
-    return False
-
-# =============================
-# TRADE LOG
-# =============================
-def log_trade(entry, exit_price, side):
-    pnl = (exit_price - entry) if side == "LONG" else (entry - exit_price)
-    with open(TRADE_LOG_FILE, "a") as f:
-        f.write(f"{time.time()},{side},{entry},{exit_price},{pnl}\n")
+last_msg_time = time.time()
 
 # =============================
 # LOAD HISTORY
@@ -124,7 +90,9 @@ def load_history():
     global prev_close, ema, atr, rsi_avg_gain, rsi_avg_loss
     global vwap_pv_sum, vwap_vol_sum
 
-    klines = client.futures_klines(symbol=SYMBOL_UPPER, interval="5m", limit=300)
+    print("📥 Loading history...")
+
+    klines = client.futures_klines(symbol=SYMBOL_UPPER, interval=INTERVAL, limit=300)
 
     closes, highs, lows, volumes = [], [], [], []
 
@@ -134,13 +102,11 @@ def load_history():
         lows.append(float(k[3]))
         volumes.append(float(k[5]))
 
-    # EMA
     ema_series = closes[0]
     for c in closes:
         ema_series = (c - ema_series) * alpha + ema_series
     ema = ema_series
 
-    # ATR
     tr_list = []
     for i in range(1, len(closes)):
         tr = max(
@@ -151,7 +117,6 @@ def load_history():
         tr_list.append(tr)
     atr = sum(tr_list[-ATR_PERIOD:]) / ATR_PERIOD
 
-    # RSI
     gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
@@ -161,7 +126,6 @@ def load_history():
     rsi_avg_gain = sum(gains[-RSI_PERIOD:]) / RSI_PERIOD
     rsi_avg_loss = sum(losses[-RSI_PERIOD:]) / RSI_PERIOD
 
-    # VWAP
     for i in range(len(closes)):
         pv = closes[i] * volumes[i]
         vwap_queue.append((pv, volumes[i]))
@@ -169,6 +133,8 @@ def load_history():
         vwap_vol_sum += volumes[i]
 
     prev_close = closes[-1]
+
+    print("✅ History Loaded")
 
 # =============================
 # UPDATE INDICATORS
@@ -179,14 +145,11 @@ def update_indicators(candle):
 
     high, low, close, volume = candle["high"], candle["low"], candle["close"], candle["volume"]
 
-    # EMA
     ema = (close - ema) * alpha + ema
 
-    # ATR
     tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
     atr = ((atr * (ATR_PERIOD - 1)) + tr) / ATR_PERIOD
 
-    # RSI
     change = close - prev_close
     gain = max(change, 0)
     loss = max(-change, 0)
@@ -197,8 +160,8 @@ def update_indicators(candle):
     rs = rsi_avg_gain / rsi_avg_loss if rsi_avg_loss != 0 else 0
     rsi = 100 - (100 / (1 + rs))
 
-    # VWAP
     pv = close * volume
+
     if len(vwap_queue) == VWAP_WINDOW:
         old_pv, old_vol = vwap_queue.popleft()
         vwap_pv_sum -= old_pv
@@ -212,101 +175,25 @@ def update_indicators(candle):
 
     prev_close = close
 
-    return {"EMA": ema, "ATR": atr, "RSI": rsi, "VWAP": vwap_val, "close": close}
+    return {"close": close, "RSI": rsi}
 
 # =============================
-# EXECUTE TRADE
-# =============================
-def execute_trade(ind):
-    global current_trade
-
-    try:
-        if current_trade["side"] is not None:
-            log_decision("Skipped: already in trade (local)")
-            return
-
-        if has_position():
-            log_decision("Skipped: existing Binance position")
-            return
-
-        price = ind["close"]
-        atr_val = ind["ATR"]
-
-        long_cond = price > ind["EMA"] and price < ind["VWAP"] * 1.002 and ind["RSI"] < 45
-        short_cond = price < ind["EMA"] and price > ind["VWAP"] * 0.998 and ind["RSI"] > 55
-
-        if long_cond:
-            side = "LONG"
-        elif short_cond:
-            side = "SHORT"
-        else:
-            log_decision(f"No signal | Price:{price} RSI:{ind['RSI']:.2f}")
-            return
-
-        balance = get_balance()
-        qty = round_qty((balance * RISK_PERCENT * LEVERAGE) / price)
-
-        if qty < F["min_qty"]:
-            log_error(f"Qty too small: {qty}")
-            return
-
-        entry_order = client.futures_create_order(
-            symbol=SYMBOL_UPPER,
-            side="BUY" if side == "LONG" else "SELL",
-            type="MARKET",
-            quantity=qty
-        )
-
-        entry = float(entry_order.get("avgPrice", 0)) or price
-
-        if side == "LONG":
-            sl = round_price(entry - atr_val * SL_MULT)
-            tp = round_price(entry + atr_val * TP_MULT)
-            exit_side = "SELL"
-        else:
-            sl = round_price(entry + atr_val * SL_MULT)
-            tp = round_price(entry - atr_val * TP_MULT)
-            exit_side = "BUY"
-
-        sl_order = client.futures_create_order(
-            symbol=SYMBOL_UPPER,
-            side=exit_side,
-            type="STOP_MARKET",
-            stopPrice=sl,
-            closePosition=True
-        )
-
-        tp_order = client.futures_create_order(
-            symbol=SYMBOL_UPPER,
-            side=exit_side,
-            type="TAKE_PROFIT_MARKET",
-            stopPrice=tp,
-            closePosition=True
-        )
-
-        current_trade = {
-            "side": side,
-            "entry": entry,
-            "sl_id": sl_order["orderId"],
-            "tp_id": tp_order["orderId"]
-        }
-
-        print(f"✅ {side} ENTRY @ {entry}", flush=True)
-
-    except Exception as e:
-        log_error(f"Trade execution error: {str(e)}")
-
-# =============================
-# SOCKET
+# SOCKET HANDLER
 # =============================
 def handle_socket(msg):
+    global last_msg_time
+    last_msg_time = time.time()
+
     try:
+        print("📩 Data received")  # heartbeat
+
         if msg.get('e') != 'kline':
             return
 
         k = msg['k']
+
         if not k['x']:
-            return
+            return  # wait for candle close
 
         candle = {
             "open": float(k['o']),
@@ -318,12 +205,25 @@ def handle_socket(msg):
 
         ind = update_indicators(candle)
 
-        print(f"📡 Price: {ind['close']} RSI: {ind['RSI']:.2f}", flush=True)
-
-        execute_trade(ind)
+        print(f"📊 Close: {ind['close']} | RSI: {ind['RSI']:.2f}")
 
     except Exception as e:
         log_error(f"Socket error: {str(e)}")
+
+# =============================
+# WATCHDOG (AUTO RECONNECT)
+# =============================
+def watchdog():
+    global last_msg_time
+
+    while True:
+        if time.time() - last_msg_time > 60:
+            log_error("⚠️ No data received for 60s (socket issue)")
+            print("⚠️ Socket seems dead. Restarting...")
+
+            os._exit(1)  # restart externally (best practice)
+
+        time.sleep(10)
 
 # =============================
 # MAIN
@@ -333,14 +233,22 @@ if __name__ == "__main__":
 
     load_history()
 
+    print("🔌 Starting WebSocket...")
+
     twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
     twm.start()
 
     twm.start_kline_socket(
         callback=handle_socket,
         symbol=SYMBOL_UPPER,
-        interval="5m"
+        interval=INTERVAL
     )
+
+    print("✅ WebSocket Started")
+
+    # Start watchdog
+    import threading
+    threading.Thread(target=watchdog, daemon=True).start()
 
     while True:
         time.sleep(2)
