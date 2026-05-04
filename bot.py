@@ -1,14 +1,8 @@
 import os
-import sys
 import time
 import math
-import json
-import signal
 import logging
-import threading
 from decimal import Decimal, ROUND_DOWN
-from datetime import date
-from collections import deque
 
 from dotenv import load_dotenv
 from binance.client import Client
@@ -26,251 +20,236 @@ SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 2
+RISK_PCT = 1.0   # use full balance for small account
 
-# 🔥 tuned strategy
-EMA_PERIOD = 198
+EMA_PERIOD = 50
 RSI_PERIOD = 14
-ATR_PERIOD = 14
-VWAP_WINDOW = 50
-
-TP_MULT = 1.2
-SL_MULT = 0.8
-
-LONG_RSI_MIN = 48
-SHORT_RSI_MAX = 52
-VWAP_BAND = 0.003
-
-LOG_FILE = "bot.log"
 
 # =============================
 # LOGGING
 # =============================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger()
 
 # =============================
 # BOT
 # =============================
 class Bot:
+
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET)
-        self.position = None
-        self.entry_price = None
 
         self.ema = None
-        self.atr = None
         self.prev_close = None
+
         self.rsi_gain = None
         self.rsi_loss = None
 
-        self.vwap_q = deque(maxlen=VWAP_WINDOW)
-        self.vwap_pv = 0
-        self.vwap_vol = 0
+        self.position = None
+        self.position_mode = "BOTH"  # default
+
+        self.step = 0.001
+        self.tick = 0.01
+        self.min_notional = 20
 
         self.alpha = 2 / (EMA_PERIOD + 1)
 
-        self.min_qty = None
-        self.step = None
-        self.tick = None
-        self.min_notional = None
-
     # =============================
-    # UTILS
+    # HELPERS
     # =============================
     def round_qty(self, q):
-        return float(Decimal(q).quantize(Decimal(str(self.step)), rounding=ROUND_DOWN))
+        return float(Decimal(q).quantize(Decimal(str(self.step)), ROUND_DOWN))
 
     def round_price(self, p):
-        return float(Decimal(p).quantize(Decimal(str(self.tick)), rounding=ROUND_DOWN))
-
-    # =============================
-    def load_filters(self):
-        info = self.client.futures_exchange_info()
-        for s in info["symbols"]:
-            if s["symbol"] == SYMBOL:
-                f = {x["filterType"]: x for x in s["filters"]}
-                self.step = float(f["LOT_SIZE"]["stepSize"])
-                self.tick = float(f["PRICE_FILTER"]["tickSize"])
-                self.min_qty = float(f["LOT_SIZE"]["minQty"])
-                self.min_notional = float(f["MIN_NOTIONAL"]["notional"])
-                log.info(f"Filters loaded | min_notional={self.min_notional}")
-
-    def set_leverage(self):
-        self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        return float(Decimal(p).quantize(Decimal(str(self.tick)), ROUND_DOWN))
 
     def get_balance(self):
-        return float(self.client.futures_account()["totalWalletBalance"])
+        acc = self.client.futures_account()
+        return float(acc["totalWalletBalance"])
 
-    # =============================
-    # 🔥 FIXED POSITION SIZING
-    # =============================
-    def calc_qty(self, price):
-        balance = self.get_balance()
-        effective = balance * LEVERAGE
-
-        qty = effective / price
-        qty = self.round_qty(qty)
-
-        notional = qty * price
-
-        if notional < self.min_notional:
-            qty = self.round_qty(self.min_notional / price)
-
-        log.info(f"Qty={qty} Notional={qty*price:.2f}")
-        return qty
+    def detect_mode(self):
+        try:
+            info = self.client.futures_get_position_mode()
+            if info["dualSidePosition"]:
+                log.info("HEDGE MODE detected")
+                return "HEDGE"
+        except:
+            pass
+        log.info("ONE-WAY MODE detected")
+        return "ONEWAY"
 
     # =============================
     # INDICATORS
     # =============================
-    def load_history(self):
-        klines = self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=300)
+    def update_indicators(self, close):
+        if self.ema is None:
+            self.ema = close
+            self.prev_close = close
+            return None, None
 
-        closes = [float(k[4]) for k in klines]
-        highs = [float(k[2]) for k in klines]
-        lows = [float(k[3]) for k in klines]
-        vols = [float(k[5]) for k in klines]
+        # EMA
+        self.ema += self.alpha * (close - self.ema)
 
-        self.ema = closes[0]
-        for c in closes:
-            self.ema += self.alpha * (c - self.ema)
-
-        trs = [
-            max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
-            for i in range(1, len(closes))
-        ]
-
-        self.atr = sum(trs[:ATR_PERIOD]) / ATR_PERIOD
-
-        gains = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
-        losses = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
-
-        self.rsi_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
-        self.rsi_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
-
-        self.prev_close = closes[-1]
-
-    def update_indicators(self, h, l, c, v):
-        self.ema += self.alpha * (c - self.ema)
-
-        tr = max(h - l, abs(h - self.prev_close), abs(l - self.prev_close))
-        self.atr = (self.atr * 13 + tr) / 14
-
-        change = c - self.prev_close
+        # RSI
+        change = close - self.prev_close
         gain = max(change, 0)
         loss = max(-change, 0)
 
-        self.rsi_gain = (self.rsi_gain * 13 + gain) / 14
-        self.rsi_loss = (self.rsi_loss * 13 + loss) / 14
+        if self.rsi_gain is None:
+            self.rsi_gain = gain
+            self.rsi_loss = loss
+        else:
+            self.rsi_gain = (self.rsi_gain * 13 + gain) / 14
+            self.rsi_loss = (self.rsi_loss * 13 + loss) / 14
 
-        rs = self.rsi_gain / self.rsi_loss if self.rsi_loss else 100
+        rs = self.rsi_gain / self.rsi_loss if self.rsi_loss != 0 else 0
         rsi = 100 - (100 / (1 + rs))
 
-        self.prev_close = c
-        return rsi
+        self.prev_close = close
+
+        return self.ema, rsi
 
     # =============================
-    # 🔥 ORDER (FIXED)
+    # POSITION SIZE
+    # =============================
+    def get_qty(self, price):
+        balance = self.get_balance()
+        effective = balance * LEVERAGE * RISK_PCT
+
+        qty = self.round_qty(effective / price)
+        notional = qty * price
+
+        log.info(f"Balance={balance:.2f} Qty={qty} Notional={notional:.2f}")
+
+        if notional < self.min_notional:
+            log.warning("Below min notional")
+            return None
+
+        return qty
+
+    # =============================
+    # TRADE
     # =============================
     def place_trade(self, side, price):
-        qty = self.calc_qty(price)
 
-        order = self.client.futures_create_order(
-            symbol=SYMBOL,
-            side=side,
-            type="MARKET",
-            quantity=qty
-        )
-
-        entry_price = float(order["avgPrice"])
-        log.info(f"ENTRY {side} @ {entry_price}")
-
-        sl = entry_price - self.atr * SL_MULT if side == "BUY" else entry_price + self.atr * SL_MULT
-        tp = entry_price + self.atr * TP_MULT if side == "BUY" else entry_price - self.atr * TP_MULT
+        qty = self.get_qty(price)
+        if qty is None:
+            return
 
         opposite = "SELL" if side == "BUY" else "BUY"
 
-        # 🔥 FIXED SL
-        self.client.futures_create_order(
-            symbol=SYMBOL,
-            side=opposite,
-            type="STOP",
-            price=self.round_price(sl),
-            stopPrice=self.round_price(sl),
-            quantity=qty,
-            reduceOnly=True,
-            timeInForce="GTC",
-        )
+        try:
+            # ENTRY
+            order = self.client.futures_create_order(
+                symbol=SYMBOL,
+                side=side,
+                type="MARKET",
+                quantity=qty
+            )
 
-        # 🔥 FIXED TP
-        self.client.futures_create_order(
-            symbol=SYMBOL,
-            side=opposite,
-            type="TAKE_PROFIT",
-            price=self.round_price(tp),
-            stopPrice=self.round_price(tp),
-            quantity=qty,
-            reduceOnly=True,
-            timeInForce="GTC",
-        )
+            entry_price = float(order["avgPrice"])
+            log.info(f"ENTRY {side} @ {entry_price}")
 
-        self.position = "LONG" if side == "BUY" else "SHORT"
+            # SL / TP
+            sl = entry_price * (0.998 if side == "BUY" else 1.002)
+            tp = entry_price * (1.002 if side == "BUY" else 0.998)
+
+            params = dict(
+                symbol=SYMBOL,
+                side=opposite,
+                workingType="MARK_PRICE",
+                closePosition=True
+            )
+
+            # hedge mode fix
+            if self.position_mode == "HEDGE":
+                params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
+
+            # STOP LOSS
+            self.client.futures_create_order(
+                **params,
+                type="STOP_MARKET",
+                stopPrice=self.round_price(sl)
+            )
+
+            # TAKE PROFIT
+            self.client.futures_create_order(
+                **params,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=self.round_price(tp)
+            )
+
+            log.info("SL & TP placed successfully")
+
+        except Exception as e:
+            log.error(f"Trade error: {e}")
+
+            # emergency close
+            try:
+                self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=opposite,
+                    type="MARKET",
+                    quantity=qty,
+                    reduceOnly=True
+                )
+                log.info("Emergency close executed")
+            except:
+                log.error("Emergency close failed")
 
     # =============================
     # STRATEGY
     # =============================
-    def check_trade(self, close, rsi):
-        if self.position:
+    def check_trade(self, close, ema, rsi):
+
+        if ema is None:
             return
 
-        trend_strength = abs(close - self.ema)
-        if trend_strength < self.atr * 0.5:
-            return
+        log.info(f"C={close} EMA={ema:.2f} RSI={rsi:.2f}")
 
         # LONG
-        if close > self.ema and close < self.vwap * (1 + VWAP_BAND) and rsi > LONG_RSI_MIN:
-            log.info("LONG SIGNAL")
+        if close > ema and rsi < 50:
             self.place_trade("BUY", close)
 
         # SHORT
-        elif close < self.ema and close > self.vwap * (1 - VWAP_BAND) and rsi < SHORT_RSI_MAX:
-            log.info("SHORT SIGNAL")
+        elif close < ema and rsi > 50:
             self.place_trade("SELL", close)
 
     # =============================
-    def handle_socket(self, msg):
+    # SOCKET
+    # =============================
+    def on_message(self, msg):
+
         if msg["e"] != "kline":
             return
 
         k = msg["k"]
+
         if not k["x"]:
             return
 
-        h, l, c, v = float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])
+        close = float(k["c"])
 
-        rsi = self.update_indicators(h, l, c, v)
-
-        self.vwap = c  # simplified VWAP
-
-        log.info(f"C={c} EMA={self.ema:.2f} RSI={rsi:.1f}")
-
-        self.check_trade(c, rsi)
+        ema, rsi = self.update_indicators(close)
+        self.check_trade(close, ema, rsi)
 
     # =============================
+    # RUN
+    # =============================
     def run(self):
-        self.load_filters()
-        self.set_leverage()
-        self.load_history()
+
+        self.position_mode = self.detect_mode()
+
+        self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
         twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
         twm.start()
-        twm.start_kline_socket(callback=self.handle_socket, symbol=SYMBOL, interval=INTERVAL)
+
+        twm.start_kline_socket(
+            callback=self.on_message,
+            symbol=SYMBOL,
+            interval=INTERVAL
+        )
 
         log.info("BOT RUNNING")
 
@@ -279,5 +258,7 @@ class Bot:
 
 
 # =============================
+# START
+# =============================
 if __name__ == "__main__":
-    Bot().run()
+    Bot().run() 
