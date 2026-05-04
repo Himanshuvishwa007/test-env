@@ -35,7 +35,7 @@ SYMBOL     = "ETHUSDT"
 INTERVAL   = Client.KLINE_INTERVAL_1MINUTE
 
 LEVERAGE   = 2
-RISK_PCT   = 0.10           # fraction of wallet risked per trade
+RISK_PCT   = 1.0           # fraction of wallet risked per trade
 MAX_DAILY_LOSS_PCT = 0.05   # halt if daily loss exceeds 5%
 
 EMA_PERIOD   = 198
@@ -323,19 +323,47 @@ class TradingBot:
                 raise
 
     def _calc_qty(self, price: float) -> float | None:
-        """Compute trade quantity; returns None if below exchange minimums."""
+        """
+        Smart position sizing:
+        - Uses full balance (for small accounts)
+        - Applies leverage correctly
+        - Ensures min_notional is satisfied
+        """
+
         balance = self._fetch_balance()
         if balance <= 0:
             log.error("Balance is zero or negative.")
             return None
-        qty      = self._round_qty((balance * RISK_PCT * LEVERAGE) / price)
+
+        # 👉 Use FULL balance for small account survival
+        effective_usdt = balance * LEVERAGE
+
+        # Initial qty
+        qty = effective_usdt / price
+        qty = self._round_qty(qty)
+
         notional = qty * price
+
+        # 🔥 Force meet min_notional if needed
+        if notional < self._min_notional:
+            required_qty = self._min_notional / price
+            qty = self._round_qty(required_qty)
+            notional = qty * price
+
+            log.warning(
+                f"Adjusted qty to meet min_notional → qty={qty}, notional={notional:.2f}"
+            )
+
+        # Final validation
         if qty < self._min_qty:
             log.warning(f"Qty {qty} < min_qty {self._min_qty}. Skipping.")
             return None
-        if notional < self._min_notional:
-            log.warning(f"Notional {notional:.2f} < min_notional {self._min_notional}. Skipping.")
-            return None
+
+        log.info(
+            f"Position sizing | balance={balance:.2f} "
+            f"effective={effective_usdt:.2f} qty={qty} notional={notional:.2f}"
+        )
+
         return qty
 
     def _place_order_atomic(
