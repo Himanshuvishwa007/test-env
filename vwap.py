@@ -1,379 +1,852 @@
+"""
+Production ETH/USDT Futures Bot
+Strategy : EMA trend + VWAP pullback + RSI filter
+Interval : 1m  (configurable)
+"""
+
 import os
+import sys
 import time
 import math
+import json
+import signal
+import logging
+import threading
 from decimal import Decimal, ROUND_DOWN
+from functools import wraps
+from datetime import date
+from collections import deque
+from logging.handlers import RotatingFileHandler
+
 from dotenv import load_dotenv
 from binance.client import Client
 from binance import ThreadedWebsocketManager
-from collections import deque
+from binance.exceptions import BinanceAPIException
 
-# =============================
+# =============================================================
 # CONFIG
-# =============================
+# =============================================================
 load_dotenv()
 
-API_KEY = os.getenv("BINANCE_LIVE_API_KEY")
+API_KEY    = os.getenv("BINANCE_LIVE_API_KEY")
 API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 
-SYMBOL = "ETHUSDT"
-INTERVAL = "1m"
+SYMBOL     = "ETHUSDT"
+INTERVAL   = Client.KLINE_INTERVAL_1MINUTE
 
-LEVERAGE = 2
-RISK_PERCENT = 0.1
+LEVERAGE   = 2
+RISK_PCT   = 0.10           # fraction of wallet risked per trade
+MAX_DAILY_LOSS_PCT = 0.05   # halt if daily loss exceeds 5%
 
-EMA_TREND = 198
-RSI_PERIOD = 15
-ATR_PERIOD = 15
-VWAP_WINDOW = 51
+EMA_PERIOD   = 198
+RSI_PERIOD   = 15
+ATR_PERIOD   = 15
+VWAP_WINDOW  = 51
 
-TP_MULT = 1.5
-SL_MULT = 1.0
+TP_MULT   = 1.5
+SL_MULT   = 1.0
 
-client = Client(API_KEY, API_SECRET)
+LONG_RSI_MAX  = 45    # RSI must be BELOW this to enter long
+SHORT_RSI_MIN = 55    # RSI must be ABOVE this to enter short
+VWAP_BAND     = 0.01  # price must be within 1% of VWAP
 
-# =============================
-# SET LEVERAGE
-# =============================
-client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+STATE_FILE         = "bot_state.json"
+LOG_FILE           = "bot.log"
+WATCHDOG_TIMEOUT_S = 180   # restart websocket if silent for 3 min
+FILL_POLL_INTERVAL = 0.5   # seconds between fill-status polls
+FILL_POLL_RETRIES  = 10    # total fill wait = 5 s
 
-# =============================
-# FILTERS
-# =============================
-def get_filters():
-    info = client.futures_exchange_info()
-    for s in info["symbols"]:
-        if s["symbol"] == SYMBOL:
-            f = {x["filterType"]: x for x in s["filters"]}
-            return {
-                "step": float(f["LOT_SIZE"]["stepSize"]),
-                "tick": float(f["PRICE_FILTER"]["tickSize"]),
-                "min_qty": float(f["LOT_SIZE"]["minQty"])
-            }
 
-F = get_filters()
+# =============================================================
+# LOGGING
+# =============================================================
+def _build_logger() -> logging.Logger:
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
 
-def round_qty(q):
-    q = math.floor(q / F["step"]) * F["step"]
-    return float(Decimal(str(q)).quantize(Decimal(str(F["step"])), ROUND_DOWN))
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
 
-def round_price(p):
-    return float(Decimal(str(p)).quantize(Decimal(str(F["tick"])), ROUND_DOWN))
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
 
-# =============================
-# GLOBAL STATE
-# =============================
-ema = None
-atr = None
-rsi_avg_gain = None
-rsi_avg_loss = None
-prev_close = None
+    root.addHandler(ch)
+    root.addHandler(fh)
+    return logging.getLogger("bot")
 
-# FIX 3: Track VWAP sums alongside the deque to keep them consistent
-vwap_queue = deque(maxlen=VWAP_WINDOW)
-vwap_pv_sum = 0.0
-vwap_vol_sum = 0.0
+log = _build_logger()
 
-position = None  # Will be synced from Binance on startup
 
-alpha = 2 / (EMA_TREND + 1)
+# =============================================================
+# RETRY DECORATOR
+# =============================================================
+def retry(max_attempts: int = 3, base_delay: float = 1.5, backoff: float = 2.0):
+    """Exponential back-off retry for Binance API calls."""
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            delay = base_delay
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as exc:
+                    if attempt == max_attempts:
+                        log.error(
+                            f"[RETRY] {fn.__name__} gave up after "
+                            f"{max_attempts} attempts: {exc}"
+                        )
+                        raise
+                    log.warning(
+                        f"[RETRY] {fn.__name__} attempt {attempt}/{max_attempts} "
+                        f"failed: {exc}. Retrying in {delay:.1f}s ..."
+                    )
+                    time.sleep(delay)
+                    delay *= backoff
+        return wrapper
+    return decorator
 
-# =============================
-# FIX 2: SYNC POSITION FROM BINANCE
-# =============================
-def sync_position():
-    """Read actual open position from Binance so restarts don't lose state."""
-    global position
-    try:
-        positions = client.futures_position_information(symbol=SYMBOL)
+
+# =============================================================
+# BOT
+# =============================================================
+class TradingBot:
+    """
+    Single-symbol futures bot.
+
+    Thread model
+    ------------
+    Main thread       : start-up, blocking event loop
+    WebSocket thread  : candle events  ->  _handle_socket()
+    Watchdog thread   : detects silent websocket, restarts it
+    Daily-maint thread: daily balance reset / halt flag check
+
+    All mutable state is protected by self._lock (RLock so
+    methods that hold the lock can safely call each other).
+    """
+
+    def __init__(self):
+        self._client   = Client(API_KEY, API_SECRET)
+        self._lock     = threading.RLock()
+        self._shutdown = threading.Event()
+
+        # -- Indicator state ------------------------------------------
+        self._ema: float | None        = None
+        self._atr: float | None        = None
+        self._rsi_gain: float | None   = None
+        self._rsi_loss: float | None   = None
+        self._prev_close: float | None = None
+        self._alpha = 2.0 / (EMA_PERIOD + 1)
+
+        self._vwap_q   = deque(maxlen=VWAP_WINDOW)
+        self._vwap_pv  = 0.0
+        self._vwap_vol = 0.0
+
+        # -- Position / order state ------------------------------------
+        self._position: str | None      = None   # None | "LONG" | "SHORT"
+        self._sl_id: int | None         = None
+        self._tp_id: int | None         = None
+        self._entry_price: float | None = None
+        self._entry_qty: float | None   = None
+
+        # -- Daily guard -----------------------------------------------
+        self._today                       = date.today()
+        self._daily_start_bal: float | None = None
+        self._halted: bool                = False
+
+        # -- Exchange filters (loaded once at startup) -----------------
+        self._step: float | None         = None
+        self._tick: float | None         = None
+        self._min_qty: float | None      = None
+        self._min_notional: float | None = None
+
+        # -- WebSocket health ------------------------------------------
+        self._twm: ThreadedWebsocketManager | None = None
+        self._last_candle_ts: float | None         = None
+
+    # ==============================================================
+    # ROUNDING
+    # ==============================================================
+    def _round_qty(self, q: float) -> float:
+        q = math.floor(q / self._step) * self._step
+        return float(Decimal(str(q)).quantize(Decimal(str(self._step)), ROUND_DOWN))
+
+    def _round_price(self, p: float) -> float:
+        return float(Decimal(str(p)).quantize(Decimal(str(self._tick)), ROUND_DOWN))
+
+    # ==============================================================
+    # ONE-TIME SETUP
+    # ==============================================================
+    @retry(max_attempts=3)
+    def _load_filters(self):
+        info = self._client.futures_exchange_info()
+        for sym in info["symbols"]:
+            if sym["symbol"] != SYMBOL:
+                continue
+            fmap = {f["filterType"]: f for f in sym["filters"]}
+            self._step         = float(fmap["LOT_SIZE"]["stepSize"])
+            self._tick         = float(fmap["PRICE_FILTER"]["tickSize"])
+            self._min_qty      = float(fmap["LOT_SIZE"]["minQty"])
+            self._min_notional = float(
+                fmap.get("MIN_NOTIONAL", {}).get("notional", 5.0)
+            )
+            log.info(
+                f"Filters | step={self._step} tick={self._tick} "
+                f"min_qty={self._min_qty} min_notional={self._min_notional}"
+            )
+            return
+        raise RuntimeError(f"Symbol {SYMBOL} not found in exchange info")
+
+    @retry(max_attempts=3)
+    def _set_leverage(self):
+        self._client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        log.info(f"Leverage set to {LEVERAGE}x")
+
+    # ==============================================================
+    # STATE PERSISTENCE  (survive restarts)
+    # ==============================================================
+    def _save_state(self):
+        state = {
+            "position":        self._position,
+            "sl_id":           self._sl_id,
+            "tp_id":           self._tp_id,
+            "entry_price":     self._entry_price,
+            "entry_qty":       self._entry_qty,
+            "today":           str(self._today),
+            "daily_start_bal": self._daily_start_bal,
+            "halted":          self._halted,
+        }
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+            log.debug("State persisted.")
+        except Exception as exc:
+            log.warning(f"Could not save state: {exc}")
+
+    def _load_state(self):
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE) as f:
+                s = json.load(f)
+            saved_day = date.fromisoformat(s.get("today", "1970-01-01"))
+            if saved_day == date.today():
+                self._position        = s.get("position")
+                self._sl_id           = s.get("sl_id")
+                self._tp_id           = s.get("tp_id")
+                self._entry_price     = s.get("entry_price")
+                self._entry_qty       = s.get("entry_qty")
+                self._daily_start_bal = s.get("daily_start_bal")
+                self._halted          = s.get("halted", False)
+                log.info(
+                    f"State restored | pos={self._position} "
+                    f"entry={self._entry_price} halted={self._halted}"
+                )
+            else:
+                log.info("State file is from a previous day - ignoring.")
+        except Exception as exc:
+            log.warning(f"Could not load state: {exc}")
+
+    # ==============================================================
+    # BALANCE
+    # ==============================================================
+    @retry(max_attempts=3)
+    def _fetch_balance(self) -> float:
+        return float(self._client.futures_account()["totalWalletBalance"])
+
+    # ==============================================================
+    # POSITION RECONCILIATION
+    # ==============================================================
+    @retry(max_attempts=3)
+    def _sync_position(self):
+        """
+        Compare internal state with Binance.
+        Detects SL/TP hits and external position changes.
+        Must be called while holding self._lock.
+        """
+        positions = self._client.futures_position_information(symbol=SYMBOL)
         for p in positions:
             amt = float(p["positionAmt"])
             if amt > 0:
-                position = "LONG"
-                print(f"⚠️  Existing LONG position detected ({amt} contracts). Will not open new trades until closed.")
+                if self._position != "LONG":
+                    log.warning(
+                        f"Binance shows LONG {amt} but bot had "
+                        f"{self._position}. Correcting."
+                    )
+                    self._position    = "LONG"
+                    self._entry_price = float(p["entryPrice"])
+                    self._entry_qty   = abs(amt)
                 return
-            elif amt < 0:
-                position = "SHORT"
-                print(f"⚠️  Existing SHORT position detected ({amt} contracts). Will not open new trades until closed.")
+            if amt < 0:
+                if self._position != "SHORT":
+                    log.warning(
+                        f"Binance shows SHORT {amt} but bot had "
+                        f"{self._position}. Correcting."
+                    )
+                    self._position    = "SHORT"
+                    self._entry_price = float(p["entryPrice"])
+                    self._entry_qty   = abs(amt)
                 return
-        position = None
-        print("✅ No open position. Ready to trade.")
-    except Exception as e:
-        print(f"❌ Could not sync position: {e}")
-        position = None
 
-# =============================
-# FIX 1: RESET POSITION STATE
-# Check Binance to see if our position was closed (by SL/TP/manually)
-# =============================
-def refresh_position_state():
-    """Called before every trade check to detect if SL/TP fired."""
-    global position
-    if position is None:
-        return
-    try:
-        positions = client.futures_position_information(symbol=SYMBOL)
-        for p in positions:
-            if float(p["positionAmt"]) != 0:
-                return  # Still in a trade
-        # If we reach here, Binance shows flat — reset our state
-        print(f"✅ Position closed (SL/TP hit or manual). Ready for next trade.")
-        position = None
-    except Exception as e:
-        print(f"⚠️  Could not refresh position state: {e}")
+        # Exchange is flat
+        if self._position is not None:
+            log.info(
+                f"SL/TP fired - position closed on exchange. "
+                f"Was {self._position}. Resetting."
+            )
+            self._position    = None
+            self._sl_id       = None
+            self._tp_id       = None
+            self._entry_price = None
+            self._entry_qty   = None
+            self._save_state()
 
-# =============================
-# LOAD HISTORY
-# =============================
-def load_history():
-    global ema, atr, rsi_avg_gain, rsi_avg_loss, prev_close
-    global vwap_pv_sum, vwap_vol_sum
+    # ==============================================================
+    # ORDER MANAGEMENT
+    # ==============================================================
+    @retry(max_attempts=3)
+    def _cancel_all_open_orders(self):
+        try:
+            open_orders = self._client.futures_get_open_orders(symbol=SYMBOL)
+            if open_orders:
+                self._client.futures_cancel_all_open_orders(symbol=SYMBOL)
+                log.info(f"Cancelled {len(open_orders)} open order(s).")
+        except BinanceAPIException as exc:
+            if exc.code == -2011:   # Unknown order - already gone
+                pass
+            else:
+                raise
 
-    # Fetch enough bars: max of all periods + buffer
-    limit = max(EMA_TREND, RSI_PERIOD, ATR_PERIOD, VWAP_WINDOW) + 50
-    klines = client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=min(limit, 500))
+    def _calc_qty(self, price: float) -> float | None:
+        """Compute trade quantity; returns None if below exchange minimums."""
+        balance = self._fetch_balance()
+        if balance <= 0:
+            log.error("Balance is zero or negative.")
+            return None
+        qty      = self._round_qty((balance * RISK_PCT * LEVERAGE) / price)
+        notional = qty * price
+        if qty < self._min_qty:
+            log.warning(f"Qty {qty} < min_qty {self._min_qty}. Skipping.")
+            return None
+        if notional < self._min_notional:
+            log.warning(f"Notional {notional:.2f} < min_notional {self._min_notional}. Skipping.")
+            return None
+        return qty
 
-    closes, highs, lows, volumes = [], [], [], []
-    typical_prices = []  # FIX 5: Use (H+L+C)/3 for VWAP, not just close
+    def _place_order_atomic(
+        self, side: str, qty: float, sl_price: float, tp_price: float
+    ) -> bool:
+        """
+        Atomic order placement:
+          1. Cancel stale open orders.
+          2. Submit market entry.
+          3. Poll until FILLED - use actual executedQty + avgPrice.
+          4. Place SL.  Failure -> emergency close.
+          5. Place TP.  Failure -> cancel SL + emergency close.
+        Returns True on full success.
+        """
+        opposite = "SELL" if side == "BUY" else "BUY"
 
-    for k in klines:
-        h, l, c, v = float(k[2]), float(k[3]), float(k[4]), float(k[5])
-        closes.append(c)
-        highs.append(h)
-        lows.append(l)
-        volumes.append(v)
-        typical_prices.append((h + l + c) / 3)
+        # 1. Clean slate
+        self._cancel_all_open_orders()
 
-    # --- EMA (Wilder-style warm-up: seed with first close, then iterate) ---
-    ema_val = closes[0]
-    for c in closes:
-        ema_val = (c - ema_val) * alpha + ema_val
-    ema = ema_val
+        # 2. Market entry
+        try:
+            resp     = self._client.futures_create_order(
+                symbol=SYMBOL, side=side, type="MARKET", quantity=qty
+            )
+            order_id = resp["orderId"]
+            log.info(f"MARKET {side} submitted | qty={qty} orderId={order_id}")
+        except BinanceAPIException as exc:
+            log.error(f"Market order rejected: {exc}")
+            return False
 
-    # --- ATR: FIX 4: Proper Wilder smoothing seed ---
-    tr_list = []
-    for i in range(1, len(closes)):
+        # 3. Wait for fill confirmation
+        filled_qty = 0.0
+        avg_price  = None
+        for _ in range(FILL_POLL_RETRIES):
+            time.sleep(FILL_POLL_INTERVAL)
+            try:
+                o = self._client.futures_get_order(
+                    symbol=SYMBOL, orderId=order_id
+                )
+                if o["status"] == "FILLED":
+                    filled_qty = float(o["executedQty"])
+                    avg_price  = float(o["avgPrice"])
+                    log.info(
+                        f"Entry FILLED | avgPrice={avg_price:.4f} "
+                        f"qty={filled_qty}"
+                    )
+                    break
+            except Exception as exc:
+                log.warning(f"Fill poll error: {exc}")
+        else:
+            log.critical(
+                "Market order NOT confirmed filled within timeout. "
+                "SL/TP will NOT be placed. MANUAL ACTION REQUIRED."
+            )
+            return False
+
+        self._entry_price = avg_price
+        self._entry_qty   = filled_qty
+
+        # Recalculate SL/TP from actual fill price (eliminates slippage drift)
+        atr_sl = abs(sl_price - avg_price) if side == "BUY" else abs(avg_price - sl_price)
+        atr_tp = abs(tp_price - avg_price) if side == "BUY" else abs(avg_price - tp_price)
+        if side == "BUY":
+            sl_price = avg_price - atr_sl
+            tp_price = avg_price + atr_tp
+        else:
+            sl_price = avg_price + atr_sl
+            tp_price = avg_price - atr_tp
+
+        # 4. Stop-Loss
+        sl_id = None
+        try:
+            sl_resp = self._client.futures_create_order(
+                symbol=SYMBOL,
+                side=opposite,
+                type="STOP_MARKET",
+                stopPrice=self._round_price(sl_price),
+                closePosition=True,
+                workingType="CONTRACT_PRICE",
+            )
+            sl_id = sl_resp["orderId"]
+            log.info(f"SL placed | price={self._round_price(sl_price)} orderId={sl_id}")
+        except BinanceAPIException as exc:
+            log.error(f"SL placement FAILED: {exc}. Emergency-closing position.")
+            self._emergency_close(opposite, filled_qty)
+            return False
+
+        # 5. Take-Profit
+        try:
+            tp_resp = self._client.futures_create_order(
+                symbol=SYMBOL,
+                side=opposite,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=self._round_price(tp_price),
+                closePosition=True,
+                workingType="CONTRACT_PRICE",
+            )
+            tp_id = tp_resp["orderId"]
+            log.info(f"TP placed | price={self._round_price(tp_price)} orderId={tp_id}")
+        except BinanceAPIException as exc:
+            log.error(f"TP placement FAILED: {exc}. Cancelling SL + emergency close.")
+            try:
+                self._client.futures_cancel_order(symbol=SYMBOL, orderId=sl_id)
+            except Exception:
+                pass
+            self._emergency_close(opposite, filled_qty)
+            return False
+
+        self._sl_id = sl_id
+        self._tp_id = tp_id
+        self._save_state()
+        return True
+
+    def _emergency_close(self, side: str, qty: float):
+        """Market-close a position immediately as a safety fallback."""
+        try:
+            self._client.futures_create_order(
+                symbol=SYMBOL,
+                side=side,
+                type="MARKET",
+                quantity=qty,
+                reduceOnly=True,
+            )
+            log.info(f"Emergency close executed: {side} {qty}")
+        except Exception as exc:
+            log.critical(
+                f"EMERGENCY CLOSE FAILED: {exc}. "
+                "Live position has NO protection. MANUAL ACTION REQUIRED."
+            )
+
+    # ==============================================================
+    # INDICATOR SEEDING  (full Wilder warm-up, no shortcuts)
+    # ==============================================================
+    @retry(max_attempts=3)
+    def _load_history(self):
+        limit = min(max(EMA_PERIOD, RSI_PERIOD, ATR_PERIOD, VWAP_WINDOW) + 150, 500)
+        raw   = self._client.futures_klines(
+            symbol=SYMBOL, interval=INTERVAL, limit=limit
+        )
+
+        closes, highs, lows, vols, typical = [], [], [], [], []
+        for k in raw:
+            h, l, c, v = float(k[2]), float(k[3]), float(k[4]), float(k[5])
+            closes.append(c)
+            highs.append(h)
+            lows.append(l)
+            vols.append(v)
+            typical.append((h + l + c) / 3.0)   # correct VWAP typical price
+
+        n = len(closes)
+
+        # EMA - seed = first close, iterate every bar
+        ema = closes[0]
+        for c in closes:
+            ema += self._alpha * (c - ema)
+        self._ema = ema
+
+        # ATR - seed = simple avg of first ATR_PERIOD TRs, Wilder-smooth rest
+        trs = [
+            max(highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i]  - closes[i - 1]))
+            for i in range(1, n)
+        ]
+        atr = sum(trs[:ATR_PERIOD]) / ATR_PERIOD
+        for tr in trs[ATR_PERIOD:]:
+            atr = (atr * (ATR_PERIOD - 1) + tr) / ATR_PERIOD
+        self._atr = atr
+
+        # RSI - seed first RSI_PERIOD, Wilder-smooth remainder
+        gains  = [max(closes[i] - closes[i - 1], 0.0) for i in range(1, n)]
+        losses = [max(closes[i - 1] - closes[i], 0.0) for i in range(1, n)]
+        avg_g  = sum(gains[:RSI_PERIOD])  / RSI_PERIOD
+        avg_l  = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
+        for i in range(RSI_PERIOD, len(gains)):
+            avg_g = (avg_g * (RSI_PERIOD - 1) + gains[i])  / RSI_PERIOD
+            avg_l = (avg_l * (RSI_PERIOD - 1) + losses[i]) / RSI_PERIOD
+        self._rsi_gain = avg_g
+        self._rsi_loss = avg_l
+
+        # VWAP - rolling window seeded from last VWAP_WINDOW bars
+        self._vwap_q.clear()
+        self._vwap_pv  = 0.0
+        self._vwap_vol = 0.0
+        for tp, v in zip(typical[-VWAP_WINDOW:], vols[-VWAP_WINDOW:]):
+            pv = tp * v
+            self._vwap_q.append((pv, v))
+            self._vwap_pv  += pv
+            self._vwap_vol += v
+
+        self._prev_close = closes[-1]
+
+        log.info(
+            f"History seeded | n={n} EMA={self._ema:.2f} ATR={self._atr:.4f} "
+            f"RSI_g={self._rsi_gain:.5f} RSI_l={self._rsi_loss:.5f}"
+        )
+
+    # ==============================================================
+    # LIVE INDICATOR UPDATE  (called once per closed candle)
+    # ==============================================================
+    def _update_indicators(
+        self, high: float, low: float, close: float, volume: float
+    ) -> tuple[float, float, float, float]:
+        """
+        Must be called while holding self._lock.
+        Returns (ema, rsi, atr, vwap).
+        """
+        typical = (high + low + close) / 3.0
+
+        # EMA
+        self._ema += self._alpha * (close - self._ema)
+
+        # ATR (Wilder)
         tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
+            high - low,
+            abs(high - self._prev_close),
+            abs(low  - self._prev_close),
         )
-        tr_list.append(tr)
+        self._atr = (self._atr * (ATR_PERIOD - 1) + tr) / ATR_PERIOD
 
-    # Seed with simple average of first ATR_PERIOD TRs, then Wilder-smooth the rest
-    atr_val = sum(tr_list[:ATR_PERIOD]) / ATR_PERIOD
-    for tr in tr_list[ATR_PERIOD:]:
-        atr_val = ((atr_val * (ATR_PERIOD - 1)) + tr) / ATR_PERIOD
-    atr = atr_val
+        # RSI (Wilder)
+        change = close - self._prev_close
+        self._rsi_gain = (self._rsi_gain * (RSI_PERIOD - 1) + max(change, 0.0))  / RSI_PERIOD
+        self._rsi_loss = (self._rsi_loss * (RSI_PERIOD - 1) + max(-change, 0.0)) / RSI_PERIOD
+        rs  = self._rsi_gain / self._rsi_loss if self._rsi_loss > 0 else 100.0
+        rsi = 100.0 - (100.0 / (1.0 + rs))
 
-    # --- RSI ---
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
+        # VWAP (rolling window - evict oldest before deque auto-evicts)
+        pv = typical * volume
+        if len(self._vwap_q) == VWAP_WINDOW:
+            old_pv, old_v   = self._vwap_q[0]   # peek what WILL be evicted
+            self._vwap_pv  -= old_pv
+            self._vwap_vol -= old_v
+        self._vwap_q.append((pv, volume))
+        self._vwap_pv  += pv
+        self._vwap_vol += volume
+        vwap = self._vwap_pv / self._vwap_vol if self._vwap_vol > 0 else close
 
-    rsi_avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
-    rsi_avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
-    for i in range(RSI_PERIOD, len(gains)):
-        rsi_avg_gain = ((rsi_avg_gain * (RSI_PERIOD - 1)) + gains[i]) / RSI_PERIOD
-        rsi_avg_loss = ((rsi_avg_loss * (RSI_PERIOD - 1)) + losses[i]) / RSI_PERIOD
+        self._prev_close = close
+        return self._ema, rsi, self._atr, vwap
 
-    # --- VWAP: FIX 3: Build queue cleanly, recompute sums from scratch ---
-    vwap_queue.clear()
-    vwap_pv_sum = 0.0
-    vwap_vol_sum = 0.0
+    # ==============================================================
+    # DAILY GUARD
+    # ==============================================================
+    def _daily_reset_if_needed(self):
+        """Call under self._lock."""
+        today = date.today()
+        if today != self._today:
+            self._today           = today
+            self._daily_start_bal = self._fetch_balance()
+            self._halted          = False
+            self._save_state()
+            log.info(f"New trading day | start balance={self._daily_start_bal:.2f} USDT")
 
-    recent_tp = typical_prices[-VWAP_WINDOW:]
-    recent_vol = volumes[-VWAP_WINDOW:]
+    def _daily_loss_exceeded(self) -> bool:
+        """Returns True (and halts bot) if today's loss is over the limit."""
+        if self._halted:
+            return True
+        if not self._daily_start_bal:
+            return False
+        current   = self._fetch_balance()
+        loss_frac = (self._daily_start_bal - current) / self._daily_start_bal
+        if loss_frac >= MAX_DAILY_LOSS_PCT:
+            log.error(
+                f"Daily loss limit hit ({loss_frac * 100:.2f}% >= "
+                f"{MAX_DAILY_LOSS_PCT * 100:.0f}%). Bot halted for today."
+            )
+            self._halted = True
+            self._save_state()
+        return self._halted
 
-    for tp, v in zip(recent_tp, recent_vol):
-        pv = tp * v
-        vwap_queue.append((pv, v))
-        vwap_pv_sum += pv
-        vwap_vol_sum += v
+    # ==============================================================
+    # STRATEGY
+    # ==============================================================
+    def _check_trade(
+        self,
+        close: float,
+        ema: float,
+        rsi: float,
+        atr: float,
+        vwap: float,
+    ):
+        with self._lock:
+            if self._halted:
+                log.warning("Bot halted (daily loss). No new entries.")
+                return
 
-    prev_close = closes[-1]
+            # Reconcile - this is where SL/TP hits get detected
+            self._sync_position()
 
-    print(f"✅ History Loaded | EMA={ema:.2f} | ATR={atr:.4f} | RSI_gain={rsi_avg_gain:.4f}")
+            if self._position is not None:
+                log.debug(f"In {self._position}. Waiting for exit.")
+                return
 
-# =============================
-# INDICATORS
-# =============================
-def update_indicators(candle):
-    global ema, atr, rsi_avg_gain, rsi_avg_loss, prev_close
-    global vwap_pv_sum, vwap_vol_sum
+            # API call only when flat (not on every candle)
+            if self._daily_loss_exceeded():
+                return
 
-    high, low, close, volume = candle
-    typical_price = (high + low + close) / 3  # FIX 5: proper typical price
+            qty = self._calc_qty(close)
+            if qty is None:
+                return
 
-    # EMA
-    ema = (close - ema) * alpha + ema
+            atr_sl = atr * SL_MULT
+            atr_tp = atr * TP_MULT
 
-    # ATR
-    tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-    atr = ((atr * (ATR_PERIOD - 1)) + tr) / ATR_PERIOD
+            # LONG: price above EMA (uptrend) + near VWAP (pullback) + RSI not overbought
+            if (
+                close > ema
+                and close < vwap * (1 + VWAP_BAND)
+                and rsi < LONG_RSI_MAX
+            ):
+                sl = close - atr_sl
+                tp = close + atr_tp
+                log.info(
+                    f"LONG SIGNAL | C={close:.2f} EMA={ema:.2f} VWAP={vwap:.2f} "
+                    f"RSI={rsi:.1f} ATR={atr:.4f} | SL={sl:.2f} TP={tp:.2f}"
+                )
+                if self._place_order_atomic("BUY", qty, sl, tp):
+                    self._position = "LONG"
+                    self._save_state()
 
-    # RSI
-    change = close - prev_close
-    gain = max(change, 0)
-    loss = max(-change, 0)
-    rsi_avg_gain = ((rsi_avg_gain * (RSI_PERIOD - 1)) + gain) / RSI_PERIOD
-    rsi_avg_loss = ((rsi_avg_loss * (RSI_PERIOD - 1)) + loss) / RSI_PERIOD
+            # SHORT: price below EMA (downtrend) + near VWAP (pullback) + RSI not oversold
+            elif (
+                close < ema
+                and close > vwap * (1 - VWAP_BAND)
+                and rsi > SHORT_RSI_MIN
+            ):
+                sl = close + atr_sl
+                tp = close - atr_tp
+                log.info(
+                    f"SHORT SIGNAL | C={close:.2f} EMA={ema:.2f} VWAP={vwap:.2f} "
+                    f"RSI={rsi:.1f} ATR={atr:.4f} | SL={sl:.2f} TP={tp:.2f}"
+                )
+                if self._place_order_atomic("SELL", qty, sl, tp):
+                    self._position = "SHORT"
+                    self._save_state()
 
-    rs = rsi_avg_gain / rsi_avg_loss if rsi_avg_loss != 0 else 100
-    rsi = 100 - (100 / (1 + rs))
+            else:
+                log.debug(
+                    f"No signal | C={close:.2f} EMA={ema:.2f} "
+                    f"VWAP={vwap:.2f} RSI={rsi:.1f}"
+                )
 
-    # VWAP: FIX 3 — evict oldest entry's contribution before appending
-    pv = typical_price * volume
-    if len(vwap_queue) == VWAP_WINDOW:
-        old_pv, old_vol = vwap_queue[0]   # peek at what deque will evict
-        vwap_pv_sum -= old_pv
-        vwap_vol_sum -= old_vol
-    vwap_queue.append((pv, volume))
-    vwap_pv_sum += pv
-    vwap_vol_sum += volume
+    # ==============================================================
+    # WEBSOCKET HANDLER
+    # ==============================================================
+    def _handle_socket(self, msg: dict):
+        try:
+            if msg.get("e") == "error":
+                log.error(f"WebSocket error event: {msg}")
+                return
+            if msg.get("e") != "kline":
+                return
 
-    vwap = vwap_pv_sum / vwap_vol_sum if vwap_vol_sum > 0 else close
+            k = msg["k"]
+            if not k["x"]:
+                return   # only act on fully closed candles
 
-    prev_close = close
+            self._last_candle_ts = time.time()
 
-    return close, ema, rsi, atr, vwap
+            high   = float(k["h"])
+            low    = float(k["l"])
+            close  = float(k["c"])
+            volume = float(k["v"])
 
-# =============================
-# POSITION SIZE
-# =============================
-def get_position_size(price):
-    balance = float(client.futures_account()["totalWalletBalance"])
-    risk_amount = balance * RISK_PERCENT
-    qty = (risk_amount * LEVERAGE) / price
-    qty = round_qty(qty)
-    if qty < F["min_qty"]:
-        print(f"⚠️  Calculated qty {qty} below min {F['min_qty']}. Skipping trade.")
-        return None
-    return qty
+            with self._lock:
+                ema, rsi, atr, vwap = self._update_indicators(
+                    high, low, close, volume
+                )
 
-# =============================
-# EXECUTION
-# =============================
-def place_order(side, qty, sl, tp):
-    opposite = "SELL" if side == "BUY" else "BUY"
-    try:
-        # MARKET ENTRY
-        client.futures_create_order(
+            log.info(
+                f"Candle closed | C={close:.2f} EMA={ema:.2f} RSI={rsi:.1f} "
+                f"ATR={atr:.4f} VWAP={vwap:.2f} | pos={self._position}"
+            )
+
+            self._check_trade(close, ema, rsi, atr, vwap)
+
+        except Exception:
+            log.exception("Unhandled error in _handle_socket")
+
+    # ==============================================================
+    # WEBSOCKET LIFECYCLE
+    # ==============================================================
+    def _start_websocket(self):
+        self._twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+        self._twm.start()
+        self._twm.start_kline_socket(
+            callback=self._handle_socket,
             symbol=SYMBOL,
-            side=side,
-            type="MARKET",
-            quantity=qty
+            interval=INTERVAL,
         )
-        print(f"✅ Market {side} order placed: {qty}")
+        log.info("WebSocket started.")
 
-        # STOP LOSS
-        client.futures_create_order(
-            symbol=SYMBOL,
-            side=opposite,
-            type="STOP_MARKET",
-            stopPrice=round_price(sl),
-            closePosition=True,
-            timeInForce="GTC"
-        )
-        print(f"✅ SL placed at {round_price(sl)}")
+    def _restart_websocket(self):
+        log.warning("Restarting WebSocket ...")
+        try:
+            if self._twm:
+                self._twm.stop()
+        except Exception as exc:
+            log.warning(f"Error stopping old TWM: {exc}")
+        time.sleep(5)
+        self._start_websocket()
+        log.info("WebSocket restarted.")
 
-        # TAKE PROFIT
-        client.futures_create_order(
-            symbol=SYMBOL,
-            side=opposite,
-            type="TAKE_PROFIT_MARKET",
-            stopPrice=round_price(tp),
-            closePosition=True,
-            timeInForce="GTC"
-        )
-        print(f"✅ TP placed at {round_price(tp)}")
+    # ==============================================================
+    # BACKGROUND THREADS
+    # ==============================================================
+    def _watchdog(self):
+        """Detect a silent websocket and restart it."""
+        log.info("Watchdog thread started.")
+        while not self._shutdown.is_set():
+            self._shutdown.wait(timeout=30)
+            if self._shutdown.is_set():
+                break
+            if self._last_candle_ts is None:
+                continue
+            elapsed = time.time() - self._last_candle_ts
+            if elapsed > WATCHDOG_TIMEOUT_S:
+                log.warning(
+                    f"No candle for {elapsed:.0f}s "
+                    f"(limit={WATCHDOG_TIMEOUT_S}s). Restarting WebSocket."
+                )
+                self._restart_websocket()
+                self._last_candle_ts = time.time()  # prevent immediate re-trigger
 
-    except Exception as e:
-        print(f"❌ Order placement failed: {e}")
+    def _daily_maintenance(self):
+        """Check for a new calendar day and reset daily state."""
+        log.info("Daily maintenance thread started.")
+        while not self._shutdown.is_set():
+            self._shutdown.wait(timeout=60)
+            if self._shutdown.is_set():
+                break
+            try:
+                with self._lock:
+                    self._daily_reset_if_needed()
+            except Exception as exc:
+                log.warning(f"Daily maintenance error: {exc}")
 
-# =============================
-# STRATEGY
-# =============================
-def check_trade(close, ema_val, rsi, atr, vwap):
-    global position
+    # ==============================================================
+    # GRACEFUL SHUTDOWN
+    # ==============================================================
+    def _on_shutdown(self, signum, _frame):
+        log.info(f"Received {signal.Signals(signum).name}. Shutting down ...")
+        self._shutdown.set()
+        if self._twm:
+            try:
+                self._twm.stop()
+            except Exception:
+                pass
+        self._save_state()
+        log.info("Bot stopped cleanly.")
+        sys.exit(0)
 
-    # FIX 1: Always refresh position state from Binance before deciding
-    refresh_position_state()
+    # ==============================================================
+    # ENTRY POINT
+    # ==============================================================
+    def run(self):
+        signal.signal(signal.SIGINT,  self._on_shutdown)
+        signal.signal(signal.SIGTERM, self._on_shutdown)
 
-    if position is not None:
-        return
+        log.info("=" * 60)
+        log.info("  LIVE BOT STARTING")
+        log.info(f"  Symbol={SYMBOL}  Leverage={LEVERAGE}x")
+        log.info("=" * 60)
 
-    qty = get_position_size(close)
-    if qty is None:
-        return
+        # One-time setup
+        self._load_filters()
+        self._set_leverage()
 
-    # LONG: price above EMA (uptrend), near/below VWAP (pullback), RSI not overbought
-    if close > ema_val and close < vwap * 1.01 and rsi < 45:
-        sl = close - atr * SL_MULT
-        tp = close + atr * TP_MULT
-        print(f"🚀 LONG  @ {close:.2f} | SL={sl:.2f} | TP={tp:.2f} | RSI={rsi:.1f} | ATR={atr:.4f} | VWAP={vwap:.2f}")
-        place_order("BUY", qty, sl, tp)
-        position = "LONG"
+        # Restore persisted session state
+        self._load_state()
 
-    # SHORT: price below EMA (downtrend), near/above VWAP (pullback), RSI not oversold
-    elif close < ema_val and close > vwap * 0.99 and rsi > 55:
-        sl = close + atr * SL_MULT
-        tp = close - atr * TP_MULT
-        print(f"🔻 SHORT @ {close:.2f} | SL={sl:.2f} | TP={tp:.2f} | RSI={rsi:.1f} | ATR={atr:.4f} | VWAP={vwap:.2f}")
-        place_order("SELL", qty, sl, tp)
-        position = "SHORT"
+        # Seed all indicators from historical klines
+        self._load_history()
 
-    else:
-        print(f"⏳ No signal | Close={close:.2f} EMA={ema_val:.2f} VWAP={vwap:.2f} RSI={rsi:.1f}")
+        # Init daily guard
+        balance = self._fetch_balance()
+        log.info(f"Wallet balance: {balance:.2f} USDT")
+        if self._daily_start_bal is None:
+            self._daily_start_bal = balance
 
-# =============================
-# SOCKET
-# =============================
-def handle_socket(msg):
-    try:
-        if msg.get("e") != "kline":
-            return
+        # Reconcile position with exchange (handles restarts mid-trade)
+        with self._lock:
+            self._sync_position()
 
-        k = msg["k"]
+        # Cancel any orphan SL/TP orders left from a previous session
+        if self._position is None:
+            self._cancel_all_open_orders()
+        else:
+            log.info(
+                f"Resuming existing {self._position} @ {self._entry_price}. "
+                "No new entries until this position closes."
+            )
 
-        if not k["x"]:
-            return  # Only act on fully closed candles
+        # Background threads
+        threading.Thread(
+            target=self._watchdog, daemon=True, name="watchdog"
+        ).start()
+        threading.Thread(
+            target=self._daily_maintenance, daemon=True, name="daily_maint"
+        ).start()
 
-        candle = (
-            float(k["h"]),
-            float(k["l"]),
-            float(k["c"]),
-            float(k["v"])
-        )
+        # Start live feed
+        self._start_websocket()
+        log.info("Bot is live. Listening for candles ...")
 
-        close, ema_val, rsi, atr, vwap = update_indicators(candle)
+        # Keep main thread alive - everything else is event-driven
+        while not self._shutdown.is_set():
+            time.sleep(1)
 
-        print(f"📊 Close={close:.2f} | EMA={ema_val:.2f} | RSI={rsi:.1f} | ATR={atr:.4f} | VWAP={vwap:.2f} | Pos={position}")
 
-        check_trade(close, ema_val, rsi, atr, vwap)
-
-    except Exception as e:
-        print(f"❌ Socket error: {e}")
-
-# =============================
-# MAIN
-# =============================
+# =============================================================
 if __name__ == "__main__":
-    print("🚀 LIVE BOT STARTING...")
-
-    load_history()
-    sync_position()  # FIX 2: Sync position state from Binance before trading
-
-    twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
-    twm.start()
-
-    twm.start_kline_socket(
-        callback=handle_socket,
-        symbol=SYMBOL,
-        interval=INTERVAL
-    )
-
-    print("🟢 Listening for candles...")
-    while True:
-        time.sleep(1)
+    TradingBot().run()
