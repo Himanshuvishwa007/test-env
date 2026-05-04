@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import logging
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
@@ -20,8 +19,8 @@ API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
-LEVERAGE = 2
-RISK_PCT = 1.0
+LEVERAGE = 3
+RISK_PCT = 0.2   # 🔥 reduced (important for small capital)
 
 EMA_PERIOD = 50
 RSI_PERIOD = 14
@@ -50,21 +49,27 @@ class ProBot:
         self.atr = None
         self.tr_queue = deque(maxlen=ATR_PERIOD)
 
-        # VWAP
         self.vwap_queue = deque(maxlen=VWAP_WINDOW)
         self.vwap_pv = 0
         self.vwap_vol = 0
 
-        # Volume
         self.vol_queue = deque(maxlen=VOL_WINDOW)
 
         self.cooldown = 0
-
-        self.step = 0.001
-        self.tick = 0.01
-        self.min_notional = 20
+        self.in_position = False
 
         self.alpha = 2 / (EMA_PERIOD + 1)
+
+        # 🔥 Fetch exchange precision dynamically
+        info = self.client.futures_exchange_info()
+        for s in info["symbols"]:
+            if s["symbol"] == SYMBOL:
+                for f in s["filters"]:
+                    if f["filterType"] == "LOT_SIZE":
+                        self.step = float(f["stepSize"])
+                    if f["filterType"] == "PRICE_FILTER":
+                        self.tick = float(f["tickSize"])
+                break
 
     # =============================
     def round_qty(self, q):
@@ -74,19 +79,24 @@ class ProBot:
         return float(Decimal(p).quantize(Decimal(str(self.tick)), ROUND_DOWN))
 
     def get_balance(self):
-        return float(self.client.futures_account()["totalWalletBalance"])
+        return float(self.client.futures_account()["availableBalance"])
+
+    def get_position(self):
+        pos = self.client.futures_position_information(symbol=SYMBOL)[0]
+        qty = float(pos["positionAmt"])
+        return qty
 
     # =============================
     def load_history(self):
         klines = self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=150)
 
         for k in klines:
-            close = float(k[4])
-            high = float(k[2])
-            low = float(k[3])
-            volume = float(k[5])
-
-            self.update_indicators(close, high, low, volume)
+            self.update_indicators(
+                float(k[4]),
+                float(k[2]),
+                float(k[3]),
+                float(k[5])
+            )
 
         log.info("Indicators ready")
 
@@ -96,7 +106,7 @@ class ProBot:
         if self.ema is None:
             self.ema = close
             self.prev_close = close
-            return None, None, None, None
+            return None, None, None, None, None
 
         # EMA
         self.ema += self.alpha * (close - self.ema)
@@ -149,12 +159,11 @@ class ProBot:
     # =============================
     def get_qty(self, price):
         balance = self.get_balance()
-        effective = balance * LEVERAGE * RISK_PCT
+        effective = balance * RISK_PCT * LEVERAGE
 
         qty = self.round_qty(effective / price)
-        notional = qty * price
 
-        if notional < self.min_notional:
+        if qty * price < 10:  # safer min
             return None
 
         return qty
@@ -165,9 +174,13 @@ class ProBot:
         if self.cooldown > 0:
             return
 
+        if self.get_position() != 0:
+            log.info("Already in position")
+            return
+
         qty = self.get_qty(price)
         if qty is None:
-            log.info("Not enough balance")
+            log.info("Low balance")
             return
 
         opposite = "SELL" if side == "BUY" else "BUY"
@@ -180,18 +193,27 @@ class ProBot:
                 quantity=qty
             )
 
-            entry = float(order["avgPrice"]) if "avgPrice" in order else price
+            # 🔥 Get real entry from position (not order)
+            time.sleep(0.5)
+            pos = self.client.futures_position_information(symbol=SYMBOL)[0]
+            entry = float(pos["entryPrice"])
 
             sl = entry - atr if side == "BUY" else entry + atr
             tp = entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5
+
+            sl = self.round_price(sl)
+            tp = self.round_price(tp)
+
+            log.info(f"{side} @ {entry} | TP={tp} SL={sl}")
 
             # SL
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
                 type="STOP_MARKET",
-                stopPrice=self.round_price(sl),
-                closePosition=True
+                stopPrice=sl,
+                closePosition=True,
+                workingType="MARK_PRICE"
             )
 
             # TP
@@ -199,12 +221,12 @@ class ProBot:
                 symbol=SYMBOL,
                 side=opposite,
                 type="TAKE_PROFIT_MARKET",
-                stopPrice=self.round_price(tp),
-                closePosition=True
+                stopPrice=tp,
+                closePosition=True,
+                workingType="MARK_PRICE"
             )
 
             self.cooldown = COOLDOWN
-            log.info(f"{side} TRADE @ {entry}")
 
         except Exception as e:
             log.error(f"Trade error: {e}")
@@ -219,11 +241,9 @@ class ProBot:
 
         log.info(f"C={close:.2f} EMA={ema:.2f} RSI={rsi:.1f} VWAP={vwap:.2f}")
 
-        # LONG
         if close > ema and 45 < rsi < 55 and near_vwap and volume_spike:
             self.place_trade("BUY", close, atr)
 
-        # SHORT
         elif close < ema and 45 < rsi < 55 and near_vwap and volume_spike:
             self.place_trade("SELL", close, atr)
 
@@ -237,14 +257,14 @@ class ProBot:
         if not k["x"]:
             return
 
-        close = float(k["c"])
-        high = float(k["h"])
-        low = float(k["l"])
-        volume = float(k["v"])
+        ema, rsi, atr, vwap, volume_spike = self.update_indicators(
+            float(k["c"]),
+            float(k["h"]),
+            float(k["l"]),
+            float(k["v"])
+        )
 
-        ema, rsi, atr, vwap, volume_spike = self.update_indicators(close, high, low, volume)
-
-        self.strategy(close, ema, rsi, atr, vwap, volume_spike)
+        self.strategy(float(k["c"]), ema, rsi, atr, vwap, volume_spike)
 
         if self.cooldown > 0:
             self.cooldown -= 1
@@ -265,7 +285,7 @@ class ProBot:
             interval=INTERVAL
         )
 
-        log.info("PRO BOT RUNNING")
+        log.info("🚀 BOT RUNNING")
 
         while True:
             time.sleep(1)
