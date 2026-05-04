@@ -20,7 +20,7 @@ SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 2
-RISK_PCT = 1.0   # use full balance for small account
+RISK_PCT = 1.0
 
 EMA_PERIOD = 50
 RSI_PERIOD = 14
@@ -45,8 +45,7 @@ class Bot:
         self.rsi_gain = None
         self.rsi_loss = None
 
-        self.position = None
-        self.position_mode = "BOTH"  # default
+        self.position_mode = "BOTH"
 
         self.step = 0.001
         self.tick = 0.01
@@ -79,9 +78,26 @@ class Bot:
         return "ONEWAY"
 
     # =============================
+    # LOAD HISTORY (FIX RSI)
+    # =============================
+    def load_history(self):
+        klines = self.client.futures_klines(
+            symbol=SYMBOL,
+            interval=INTERVAL,
+            limit=100
+        )
+
+        for k in klines:
+            close = float(k[4])
+            self.update_indicators(close)
+
+        log.info("Indicators warmed up")
+
+    # =============================
     # INDICATORS
     # =============================
     def update_indicators(self, close):
+
         if self.ema is None:
             self.ema = close
             self.prev_close = close
@@ -102,8 +118,11 @@ class Bot:
             self.rsi_gain = (self.rsi_gain * 13 + gain) / 14
             self.rsi_loss = (self.rsi_loss * 13 + loss) / 14
 
-        rs = self.rsi_gain / self.rsi_loss if self.rsi_loss != 0 else 0
-        rsi = 100 - (100 / (1 + rs))
+        if self.rsi_loss == 0:
+            rsi = 100
+        else:
+            rs = self.rsi_gain / self.rsi_loss
+            rsi = 100 - (100 / (1 + rs))
 
         self.prev_close = close
 
@@ -128,6 +147,26 @@ class Bot:
         return qty
 
     # =============================
+    # GET FILLED PRICE (FIX BUG)
+    # =============================
+    def get_filled_price(self, order_id):
+
+        for _ in range(10):
+            time.sleep(0.3)
+
+            o = self.client.futures_get_order(
+                symbol=SYMBOL,
+                orderId=order_id
+            )
+
+            if o["status"] == "FILLED":
+                price = float(o["avgPrice"])
+                if price > 0:
+                    return price
+
+        return None
+
+    # =============================
     # TRADE
     # =============================
     def place_trade(self, side, price):
@@ -139,7 +178,7 @@ class Bot:
         opposite = "SELL" if side == "BUY" else "BUY"
 
         try:
-            # ENTRY
+            # MARKET ENTRY
             order = self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
@@ -147,7 +186,14 @@ class Bot:
                 quantity=qty
             )
 
-            entry_price = float(order["avgPrice"])
+            order_id = order["orderId"]
+
+            entry_price = self.get_filled_price(order_id)
+
+            if entry_price is None:
+                log.error("Failed to get entry price")
+                return
+
             log.info(f"ENTRY {side} @ {entry_price}")
 
             # SL / TP
@@ -161,7 +207,6 @@ class Bot:
                 closePosition=True
             )
 
-            # hedge mode fix
             if self.position_mode == "HEDGE":
                 params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
 
@@ -179,12 +224,12 @@ class Bot:
                 stopPrice=self.round_price(tp)
             )
 
-            log.info("SL & TP placed successfully")
+            log.info("SL & TP placed")
 
         except Exception as e:
             log.error(f"Trade error: {e}")
 
-            # emergency close
+            # EMERGENCY CLOSE
             try:
                 self.client.futures_create_order(
                     symbol=SYMBOL,
@@ -205,13 +250,11 @@ class Bot:
         if ema is None:
             return
 
-        log.info(f"C={close} EMA={ema:.2f} RSI={rsi:.2f}")
+        log.info(f"C={close:.2f} EMA={ema:.2f} RSI={rsi:.2f}")
 
-        # LONG
         if close > ema and rsi < 50:
             self.place_trade("BUY", close)
 
-        # SHORT
         elif close < ema and rsi > 50:
             self.place_trade("SELL", close)
 
@@ -231,6 +274,7 @@ class Bot:
         close = float(k["c"])
 
         ema, rsi = self.update_indicators(close)
+
         self.check_trade(close, ema, rsi)
 
     # =============================
@@ -241,6 +285,8 @@ class Bot:
         self.position_mode = self.detect_mode()
 
         self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+
+        self.load_history()
 
         twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
         twm.start()
@@ -261,4 +307,4 @@ class Bot:
 # START
 # =============================
 if __name__ == "__main__":
-    Bot().run() 
+    Bot().run()
