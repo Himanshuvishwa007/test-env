@@ -3,6 +3,7 @@ import time
 import math
 import logging
 from decimal import Decimal, ROUND_DOWN
+from collections import deque
 
 from dotenv import load_dotenv
 from binance.client import Client
@@ -24,17 +25,16 @@ RISK_PCT = 1.0
 
 EMA_PERIOD = 50
 RSI_PERIOD = 14
+ATR_PERIOD = 14
 
-# =============================
-# LOGGING
+COOLDOWN = 2   # candles to wait after trade
+
 # =============================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger()
 
 # =============================
-# BOT
-# =============================
-class Bot:
+class ProBot:
 
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET)
@@ -45,7 +45,11 @@ class Bot:
         self.rsi_gain = None
         self.rsi_loss = None
 
-        self.position_mode = "BOTH"
+        self.atr = None
+        self.tr_queue = deque(maxlen=ATR_PERIOD)
+
+        self.cooldown = 0
+        self.position_mode = "ONEWAY"
 
         self.step = 0.001
         self.tick = 0.01
@@ -53,8 +57,9 @@ class Bot:
 
         self.alpha = 2 / (EMA_PERIOD + 1)
 
-    # =============================
-    # HELPERS
+        # stats
+        self.trades = 0
+
     # =============================
     def round_qty(self, q):
         return float(Decimal(q).quantize(Decimal(str(self.step)), ROUND_DOWN))
@@ -63,45 +68,27 @@ class Bot:
         return float(Decimal(p).quantize(Decimal(str(self.tick)), ROUND_DOWN))
 
     def get_balance(self):
-        acc = self.client.futures_account()
-        return float(acc["totalWalletBalance"])
+        return float(self.client.futures_account()["totalWalletBalance"])
 
-    def detect_mode(self):
-        try:
-            info = self.client.futures_get_position_mode()
-            if info["dualSidePosition"]:
-                log.info("HEDGE MODE detected")
-                return "HEDGE"
-        except:
-            pass
-        log.info("ONE-WAY MODE detected")
-        return "ONEWAY"
-
-    # =============================
-    # LOAD HISTORY (FIX RSI)
     # =============================
     def load_history(self):
-        klines = self.client.futures_klines(
-            symbol=SYMBOL,
-            interval=INTERVAL,
-            limit=100
-        )
+        klines = self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=100)
 
         for k in klines:
             close = float(k[4])
-            self.update_indicators(close)
+            high = float(k[2])
+            low = float(k[3])
+            self.update_indicators(close, high, low)
 
-        log.info("Indicators warmed up")
+        log.info("Indicators ready")
 
     # =============================
-    # INDICATORS
-    # =============================
-    def update_indicators(self, close):
+    def update_indicators(self, close, high, low):
 
         if self.ema is None:
             self.ema = close
             self.prev_close = close
-            return None, None
+            return None, None, None
 
         # EMA
         self.ema += self.alpha * (close - self.ema)
@@ -118,18 +105,19 @@ class Bot:
             self.rsi_gain = (self.rsi_gain * 13 + gain) / 14
             self.rsi_loss = (self.rsi_loss * 13 + loss) / 14
 
-        if self.rsi_loss == 0:
-            rsi = 100
-        else:
-            rs = self.rsi_gain / self.rsi_loss
-            rsi = 100 - (100 / (1 + rs))
+        rsi = 100 if self.rsi_loss == 0 else 100 - (100 / (1 + self.rsi_gain / self.rsi_loss))
+
+        # ATR
+        tr = max(high - low, abs(high - self.prev_close), abs(low - self.prev_close))
+        self.tr_queue.append(tr)
+
+        if len(self.tr_queue) == ATR_PERIOD:
+            self.atr = sum(self.tr_queue) / ATR_PERIOD
 
         self.prev_close = close
 
-        return self.ema, rsi
+        return self.ema, rsi, self.atr
 
-    # =============================
-    # POSITION SIZE
     # =============================
     def get_qty(self, price):
         balance = self.get_balance()
@@ -138,38 +126,26 @@ class Bot:
         qty = self.round_qty(effective / price)
         notional = qty * price
 
-        log.info(f"Balance={balance:.2f} Qty={qty} Notional={notional:.2f}")
-
         if notional < self.min_notional:
-            log.warning("Below min notional")
             return None
 
         return qty
 
     # =============================
-    # GET FILLED PRICE (FIX BUG)
-    # =============================
-    def get_filled_price(self, order_id):
-
+    def get_entry_price(self, order_id):
         for _ in range(10):
             time.sleep(0.3)
-
-            o = self.client.futures_get_order(
-                symbol=SYMBOL,
-                orderId=order_id
-            )
-
+            o = self.client.futures_get_order(symbol=SYMBOL, orderId=order_id)
             if o["status"] == "FILLED":
-                price = float(o["avgPrice"])
-                if price > 0:
-                    return price
-
+                return float(o["avgPrice"])
         return None
 
     # =============================
-    # TRADE
-    # =============================
-    def place_trade(self, side, price):
+    def place_trade(self, side, price, atr):
+
+        if self.cooldown > 0:
+            log.info("Cooldown active")
+            return
 
         qty = self.get_qty(price)
         if qty is None:
@@ -178,7 +154,6 @@ class Bot:
         opposite = "SELL" if side == "BUY" else "BUY"
 
         try:
-            # MARKET ENTRY
             order = self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
@@ -186,19 +161,13 @@ class Bot:
                 quantity=qty
             )
 
-            order_id = order["orderId"]
-
-            entry_price = self.get_filled_price(order_id)
-
-            if entry_price is None:
-                log.error("Failed to get entry price")
+            entry = self.get_entry_price(order["orderId"])
+            if not entry:
                 return
 
-            log.info(f"ENTRY {side} @ {entry_price}")
-
-            # SL / TP
-            sl = entry_price * (0.998 if side == "BUY" else 1.002)
-            tp = entry_price * (1.002 if side == "BUY" else 0.998)
+            # ATR based SL/TP
+            sl = entry - atr if side == "BUY" else entry + atr
+            tp = entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5
 
             params = dict(
                 symbol=SYMBOL,
@@ -207,59 +176,46 @@ class Bot:
                 closePosition=True
             )
 
-            if self.position_mode == "HEDGE":
-                params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
-
-            # STOP LOSS
+            # SL
             self.client.futures_create_order(
                 **params,
                 type="STOP_MARKET",
                 stopPrice=self.round_price(sl)
             )
 
-            # TAKE PROFIT
+            # TP
             self.client.futures_create_order(
                 **params,
                 type="TAKE_PROFIT_MARKET",
                 stopPrice=self.round_price(tp)
             )
 
-            log.info("SL & TP placed")
+            self.trades += 1
+            self.cooldown = COOLDOWN
+
+            log.info(f"TRADE #{self.trades} {side} @ {entry}")
 
         except Exception as e:
-            log.error(f"Trade error: {e}")
-
-            # EMERGENCY CLOSE
-            try:
-                self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=opposite,
-                    type="MARKET",
-                    quantity=qty,
-                    reduceOnly=True
-                )
-                log.info("Emergency close executed")
-            except:
-                log.error("Emergency close failed")
+            log.error(e)
 
     # =============================
-    # STRATEGY
-    # =============================
-    def check_trade(self, close, ema, rsi):
+    def strategy(self, close, ema, rsi, atr):
 
-        if ema is None:
+        if ema is None or atr is None:
             return
 
-        log.info(f"C={close:.2f} EMA={ema:.2f} RSI={rsi:.2f}")
+        log.info(f"C={close:.2f} EMA={ema:.2f} RSI={rsi:.1f} ATR={atr:.2f}")
 
-        if close > ema and rsi < 50:
-            self.place_trade("BUY", close)
+        # HIGH QUALITY FILTERS
 
-        elif close < ema and rsi > 50:
-            self.place_trade("SELL", close)
+        # LONG
+        if close > ema and 45 < rsi < 55:
+            self.place_trade("BUY", close, atr)
 
-    # =============================
-    # SOCKET
+        # SHORT
+        elif close < ema and 45 < rsi < 55:
+            self.place_trade("SELL", close, atr)
+
     # =============================
     def on_message(self, msg):
 
@@ -267,22 +223,22 @@ class Bot:
             return
 
         k = msg["k"]
-
         if not k["x"]:
             return
 
         close = float(k["c"])
+        high = float(k["h"])
+        low = float(k["l"])
 
-        ema, rsi = self.update_indicators(close)
+        ema, rsi, atr = self.update_indicators(close, high, low)
 
-        self.check_trade(close, ema, rsi)
+        self.strategy(close, ema, rsi, atr)
 
-    # =============================
-    # RUN
+        if self.cooldown > 0:
+            self.cooldown -= 1
+
     # =============================
     def run(self):
-
-        self.position_mode = self.detect_mode()
 
         self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
@@ -297,14 +253,12 @@ class Bot:
             interval=INTERVAL
         )
 
-        log.info("BOT RUNNING")
+        log.info("PRO BOT RUNNING")
 
         while True:
             time.sleep(1)
 
 
 # =============================
-# START
-# =============================
 if __name__ == "__main__":
-    Bot().run()
+    ProBot().run()
