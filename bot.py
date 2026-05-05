@@ -1,6 +1,5 @@
 import os
 import time
-import csv
 import logging
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
@@ -42,6 +41,7 @@ log.addHandler(console)
 file_handler = logging.FileHandler("bot.log")
 file_handler.setFormatter(formatter)
 log.addHandler(file_handler)
+
 
 # =============================
 class ProBot:
@@ -86,9 +86,12 @@ class ProBot:
     def get_balance(self):
         return float(self.client.futures_account()["availableBalance"])
 
-    def get_position(self):
+    def get_position(self, position_side="LONG"):
         pos = self.client.futures_position_information(symbol=SYMBOL)
-        return float(pos[0]["positionAmt"])
+        for p in pos:
+            if p["positionSide"] == position_side:
+                return float(p["positionAmt"])
+        return 0.0
 
     # =============================
     def update_indicators(self, close, high, low, volume):
@@ -157,9 +160,18 @@ class ProBot:
         log.info("✅ Preload complete")
 
     # =============================
+    def cancel_open_orders(self):
+        try:
+            self.client.futures_cancel_all_open_orders(symbol=SYMBOL)
+        except Exception as e:
+            log.warning(f"Cancel orders warning: {e}")
+
     def place_trade(self, side, price, atr):
 
-        if self.cooldown > 0 or self.get_position() != 0:
+        # Check both sides flat
+        if self.cooldown > 0:
+            return
+        if self.get_position("LONG") != 0 or self.get_position("SHORT") != 0:
             return
 
         if atr is None or atr <= 0:
@@ -173,11 +185,14 @@ class ProBot:
         if qty * price < self.min_notional:
             return
 
-        opposite = "SELL" if side == "BUY" else "BUY"
+        # In hedge mode: BUY opens LONG, SELL opens SHORT
+        # To close LONG -> SELL with positionSide=LONG
+        # To close SHORT -> BUY with positionSide=SHORT
         position_side = "LONG" if side == "BUY" else "SHORT"
+        close_side = "SELL" if side == "BUY" else "BUY"
 
         try:
-            # ENTRY
+            # ── ENTRY ──────────────────────────────────────────
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
@@ -188,45 +203,54 @@ class ProBot:
 
             time.sleep(0.5)
 
+            # Fetch entry price by matching positionSide
             pos = self.client.futures_position_information(symbol=SYMBOL)
-            entry = float(pos[0]['entryPrice'])
+            entry = None
+            for p in pos:
+                if p["positionSide"] == position_side:
+                    entry = float(p["entryPrice"])
+                    break
 
-            sl = entry - atr if side == "BUY" else entry + atr
-            tp = entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5
+            if not entry or entry == 0:
+                log.error("Could not fetch entry price — aborting SL/TP placement")
+                return
 
-            sl = self.round_price(sl)
-            tp = self.round_price(tp)
+            sl = self.round_price(entry - atr if side == "BUY" else entry + atr)
+            tp = self.round_price(entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5)
 
-            log.info(f"{side} | Entry={entry:.2f} TP={tp:.2f} SL={sl:.2f}")
+            log.info(f"{side} | Entry={entry:.2f} | TP={tp:.2f} | SL={sl:.2f} | Qty={qty}")
 
-            # STOP LOSS
+            # ── STOP LOSS ───────────────────────────────────────
+            # Hedge mode: positionSide required, do NOT use reduceOnly
             self.client.futures_create_order(
                 symbol=SYMBOL,
-                side=opposite,
+                side=close_side,
                 type="STOP_MARKET",
                 stopPrice=sl,
                 quantity=qty,
-                reduceOnly=True,
-                positionSide=position_side,
-                workingType="MARK_PRICE"
+                positionSide=position_side,   # ✅ matches the open position
+                workingType="MARK_PRICE",
+                timeInForce="GTE_GTC"
             )
 
-            # TAKE PROFIT
+            # ── TAKE PROFIT ─────────────────────────────────────
             self.client.futures_create_order(
                 symbol=SYMBOL,
-                side=opposite,
+                side=close_side,
                 type="TAKE_PROFIT_MARKET",
                 stopPrice=tp,
                 quantity=qty,
-                reduceOnly=True,
-                positionSide=position_side,
-                workingType="MARK_PRICE"
+                positionSide=position_side,   # ✅ matches the open position
+                workingType="MARK_PRICE",
+                timeInForce="GTE_GTC"
             )
 
             self.cooldown = COOLDOWN
 
         except Exception as e:
             log.error(f"TRADE ERROR: {e}")
+            # Cancel any orphaned SL/TP if entry succeeded but orders failed
+            self.cancel_open_orders()
 
     # =============================
     def strategy(self, close, ema, atr, rsi, vwap):
