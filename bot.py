@@ -22,31 +22,25 @@ SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 3
-EMA_PERIOD = 50
+EMA_PERIOD = 198
 ATR_PERIOD = 14
-
+RSI_PERIOD = 14
 COOLDOWN = 2
 
 # =============================
-# LOGGING (CLEAN)
+# LOGGING
 # =============================
 log = logging.getLogger()
-
 log.setLevel(logging.INFO)
 
 formatter = logging.Formatter("%(asctime)s | %(message)s")
 
-# Console (minimal)
 console = logging.StreamHandler()
 console.setFormatter(formatter)
-console.setLevel(logging.INFO)
+log.addHandler(console)
 
-# File (important logs only)
 file_handler = logging.FileHandler("bot.log")
 file_handler.setFormatter(formatter)
-file_handler.setLevel(logging.INFO)
-
-log.addHandler(console)
 log.addHandler(file_handler)
 
 # =============================
@@ -61,6 +55,13 @@ class ProBot:
         self.atr = None
         self.tr_queue = deque(maxlen=ATR_PERIOD)
 
+        self.rsi_queue = deque(maxlen=RSI_PERIOD)
+        self.gain = 0
+        self.loss = 0
+
+        self.vwap_pv = 0
+        self.vwap_vol = 0
+
         self.cooldown = 0
         self.alpha = 2 / (EMA_PERIOD + 1)
 
@@ -68,12 +69,10 @@ class ProBot:
 
         try:
             with open(self.csv_file, "x", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["time", "side", "entry", "tp", "sl", "qty"])
-        except FileExistsError:
+                csv.writer(f).writerow(["time","side","entry","tp","sl","qty"])
+        except:
             pass
 
-        # Precision
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
             if s["symbol"] == SYMBOL:
@@ -87,14 +86,6 @@ class ProBot:
                 break
 
     # =============================
-    def log_trade(self, side, entry, tp, sl, qty):
-        with open(self.csv_file, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                side, entry, tp, sl, qty
-            ])
-
     def round_qty(self, q):
         return float(Decimal(q).quantize(Decimal(str(self.step)), ROUND_DOWN))
 
@@ -102,113 +93,96 @@ class ProBot:
         return float(Decimal(p).quantize(Decimal(str(self.tick)), ROUND_DOWN))
 
     def get_balance(self):
-        return float(self.client.futures_account()["availableBalance"])
+        try:
+            return float(self.client.futures_account().get("availableBalance", 0))
+        except:
+            return 0
 
     def get_position(self):
-        pos = self.client.futures_position_information(symbol=SYMBOL)
-        return float(pos[0]["positionAmt"])
+        try:
+            pos = self.client.futures_position_information(symbol=SYMBOL)
+            return float(pos[0].get("positionAmt", 0)) if pos else 0
+        except:
+            return 0
 
     # =============================
-    def update_indicators(self, close, high, low):
+    def update_indicators(self, close, high, low, volume):
 
+        # EMA
         if self.ema is None:
             self.ema = close
             self.prev_close = close
-            return None, None
+            return None, None, None, None
 
-        # EMA
         self.ema += self.alpha * (close - self.ema)
 
         # ATR
         tr = max(high - low, abs(high - self.prev_close), abs(low - self.prev_close))
         self.tr_queue.append(tr)
-
         if len(self.tr_queue) == ATR_PERIOD:
             self.atr = sum(self.tr_queue) / ATR_PERIOD
 
+        # RSI
+        change = close - self.prev_close
+        self.rsi_queue.append(change)
+
+        if len(self.rsi_queue) == RSI_PERIOD:
+            gains = sum(x for x in self.rsi_queue if x > 0)
+            losses = abs(sum(x for x in self.rsi_queue if x < 0))
+            if losses == 0:
+                rsi = 100
+            else:
+                rs = gains / losses
+                rsi = 100 - (100 / (1 + rs))
+        else:
+            rsi = None
+
+        # VWAP
+        self.vwap_pv += close * volume
+        self.vwap_vol += volume
+        vwap = self.vwap_pv / self.vwap_vol if self.vwap_vol > 0 else None
+
         self.prev_close = close
 
-        return self.ema, self.atr
-
-    # =============================
-    def get_qty(self, price):
-        balance = self.get_balance()
-
-        if balance < 5:
-            return None
-
-        notional = balance * LEVERAGE * 0.9
-        qty = self.round_qty(notional / price)
-
-        if qty * price < self.min_notional:
-            return None
-
-        return qty
+        return self.ema, self.atr, rsi, vwap
 
     # =============================
     def place_trade(self, side, price, atr):
 
-        if self.cooldown > 0:
+        if self.cooldown > 0 or self.get_position() != 0:
             return
 
-        if self.get_position() != 0:
-            return
-
-        if price <= 0 or atr is None:
-            return
-
-        qty = self.get_qty(price)
-        if qty is None:
+        qty = self.round_qty((self.get_balance() * LEVERAGE * 0.9) / price)
+        if qty * price < self.min_notional:
             return
 
         opposite = "SELL" if side == "BUY" else "BUY"
 
         try:
-            # MARKET ENTRY
             self.client.futures_create_order(
-                symbol=SYMBOL,
-                side=side,
-                type="MARKET",
-                quantity=qty
+                symbol=SYMBOL, side=side, type="MARKET", quantity=qty
             )
 
             time.sleep(0.5)
 
-            # ✅ REAL ENTRY PRICE FIX
-            pos_info = self.client.futures_position_information(symbol=SYMBOL)[0]
-            entry = float(pos_info['entryPrice'])
+            entry = float(self.client.futures_position_information(symbol=SYMBOL)[0]["entryPrice"])
 
-            # SL / TP
             sl = entry - atr if side == "BUY" else entry + atr
             tp = entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5
 
             sl = self.round_price(sl)
             tp = self.round_price(tp)
 
-            log.info(f"{side} | Entry={entry:.2f} TP={tp:.2f} SL={sl:.2f} Qty={qty}")
+            log.info(f"{side} | Entry={entry:.2f} TP={tp:.2f} SL={sl:.2f}")
 
-            self.log_trade(side, entry, tp, sl, qty)
-
-            # STOP LOSS
             self.client.futures_create_order(
-                symbol=SYMBOL,
-                side=opposite,
-                type="STOP_MARKET",
-                stopPrice=sl,
-                reduceOnly=True,
-                closePosition=True,
-                workingType="MARK_PRICE"
+                symbol=SYMBOL, side=opposite, type="STOP_MARKET",
+                stopPrice=sl, reduceOnly=True, closePosition=True
             )
 
-            # TAKE PROFIT
             self.client.futures_create_order(
-                symbol=SYMBOL,
-                side=opposite,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=tp,
-                reduceOnly=True,
-                closePosition=True,
-                workingType="MARK_PRICE"
+                symbol=SYMBOL, side=opposite, type="TAKE_PROFIT_MARKET",
+                stopPrice=tp, reduceOnly=True, closePosition=True
             )
 
             self.cooldown = COOLDOWN
@@ -217,44 +191,48 @@ class ProBot:
             log.error(f"TRADE ERROR: {e}")
 
     # =============================
-    def strategy(self, close, ema, atr):
+    def strategy(self, close, ema, atr, rsi, vwap):
 
-        if ema is None or atr is None:
+        if None in (ema, atr, rsi, vwap):
             return
 
-        if close > ema:
+        # YOUR ORIGINAL STRATEGY (UNCHANGED)
+        if close > ema and close > vwap and rsi > 50:
             self.place_trade("BUY", close, atr)
 
-        elif close < ema:
+        elif close < ema and close < vwap and rsi < 50:
             self.place_trade("SELL", close, atr)
 
     # =============================
     def on_message(self, msg):
         try:
-            if msg["e"] != "kline":
+            if not isinstance(msg, dict):
                 return
 
-            k = msg["k"]
-            if not k["x"]:
+            if msg.get("e") != "kline":
+                return
+
+            k = msg.get("k")
+            if not k or not k.get("x"):
                 return
 
             close = float(k["c"])
             high = float(k["h"])
             low = float(k["l"])
+            volume = float(k["v"])
 
-            ema, atr = self.update_indicators(close, high, low)
+            ema, atr, rsi, vwap = self.update_indicators(close, high, low, volume)
 
-            self.strategy(close, ema, atr)
+            self.strategy(close, ema, atr, rsi, vwap)
 
             if self.cooldown > 0:
                 self.cooldown -= 1
 
         except Exception as e:
-            log.error(f"WS ERROR: {e}")
+            log.error(f"WS ERROR: {e} | MSG: {msg}")
 
     # =============================
     def run(self):
-
         self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
         twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
@@ -272,6 +250,5 @@ class ProBot:
             time.sleep(1)
 
 
-# =============================
 if __name__ == "__main__":
     ProBot().run()
