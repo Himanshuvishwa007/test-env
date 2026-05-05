@@ -86,11 +86,13 @@ class ProBot:
     def get_balance(self):
         return float(self.client.futures_account()["availableBalance"])
 
-    def get_position(self, position_side="LONG"):
+    def get_position(self):
+        """Returns current position amount. Positive = LONG, Negative = SHORT, 0 = flat."""
         pos = self.client.futures_position_information(symbol=SYMBOL)
         for p in pos:
-            if p["positionSide"] == position_side:
-                return float(p["positionAmt"])
+            amt = float(p["positionAmt"])
+            if amt != 0:
+                return amt
         return 0.0
 
     # =============================
@@ -168,10 +170,10 @@ class ProBot:
 
     def place_trade(self, side, price, atr):
 
-        # Check both sides flat
         if self.cooldown > 0:
             return
-        if self.get_position("LONG") != 0 or self.get_position("SHORT") != 0:
+
+        if self.get_position() != 0:
             return
 
         if atr is None or atr <= 0:
@@ -185,10 +187,7 @@ class ProBot:
         if qty * price < self.min_notional:
             return
 
-        # In hedge mode: BUY opens LONG, SELL opens SHORT
-        # To close LONG -> SELL with positionSide=LONG
-        # To close SHORT -> BUY with positionSide=SHORT
-        position_side = "LONG" if side == "BUY" else "SHORT"
+        # One-way mode: closing side is opposite of entry
         close_side = "SELL" if side == "BUY" else "BUY"
 
         try:
@@ -197,22 +196,21 @@ class ProBot:
                 symbol=SYMBOL,
                 side=side,
                 type="MARKET",
-                quantity=qty,
-                positionSide=position_side
+                quantity=qty
             )
 
             time.sleep(0.5)
 
-            # Fetch entry price by matching positionSide
+            # Fetch actual entry price
             pos = self.client.futures_position_information(symbol=SYMBOL)
             entry = None
             for p in pos:
-                if p["positionSide"] == position_side:
+                if float(p["positionAmt"]) != 0:
                     entry = float(p["entryPrice"])
                     break
 
             if not entry or entry == 0:
-                log.error("Could not fetch entry price — aborting SL/TP placement")
+                log.error("Could not fetch entry price — aborting SL/TP")
                 return
 
             sl = self.round_price(entry - atr if side == "BUY" else entry + atr)
@@ -221,16 +219,15 @@ class ProBot:
             log.info(f"{side} | Entry={entry:.2f} | TP={tp:.2f} | SL={sl:.2f} | Qty={qty}")
 
             # ── STOP LOSS ───────────────────────────────────────
-            # Hedge mode: positionSide required, do NOT use reduceOnly
+            # One-way mode: reduceOnly=True, NO positionSide
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=close_side,
                 type="STOP_MARKET",
                 stopPrice=sl,
                 quantity=qty,
-                positionSide=position_side,   # ✅ matches the open position
-                workingType="MARK_PRICE",
-                timeInForce="GTE_GTC"
+                reduceOnly=True,
+                workingType="MARK_PRICE"
             )
 
             # ── TAKE PROFIT ─────────────────────────────────────
@@ -240,16 +237,14 @@ class ProBot:
                 type="TAKE_PROFIT_MARKET",
                 stopPrice=tp,
                 quantity=qty,
-                positionSide=position_side,   # ✅ matches the open position
-                workingType="MARK_PRICE",
-                timeInForce="GTE_GTC"
+                reduceOnly=True,
+                workingType="MARK_PRICE"
             )
 
             self.cooldown = COOLDOWN
 
         except Exception as e:
             log.error(f"TRADE ERROR: {e}")
-            # Cancel any orphaned SL/TP if entry succeeded but orders failed
             self.cancel_open_orders()
 
     # =============================
