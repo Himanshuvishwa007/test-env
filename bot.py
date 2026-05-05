@@ -25,6 +25,7 @@ LEVERAGE = 3
 EMA_PERIOD = 198
 ATR_PERIOD = 14
 RSI_PERIOD = 14
+VWAP_PERIOD = 288   # ✅ 24h rolling VWAP
 COOLDOWN = 2
 
 # =============================
@@ -54,13 +55,12 @@ class ProBot:
 
         self.atr = None
         self.tr_queue = deque(maxlen=ATR_PERIOD)
-
         self.rsi_queue = deque(maxlen=RSI_PERIOD)
 
-        # VWAP
-        self.vwap_pv = 0
-        self.vwap_vol = 0
-        self.current_vwap_day = None
+        # ✅ Rolling VWAP
+        self.vwap_queue = deque(maxlen=VWAP_PERIOD)
+        self.vwap_pv_sum = 0
+        self.vwap_vol_sum = 0
 
         self.cooldown = 0
         self.alpha = 2 / (EMA_PERIOD + 1)
@@ -73,7 +73,7 @@ class ProBot:
         except:
             pass
 
-        # Exchange precision
+        # Precision
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
             if s["symbol"] == SYMBOL:
@@ -107,7 +107,7 @@ class ProBot:
             return 0
 
     # =============================
-    def update_indicators(self, close, high, low, volume, candle_time):
+    def update_indicators(self, close, high, low, volume):
 
         if self.ema is None:
             self.ema = close
@@ -138,18 +138,21 @@ class ProBot:
         else:
             rsi = None
 
-        # VWAP (daily reset)
-        candle_day = candle_time.date()
+        # =============================
+        # ✅ Rolling VWAP (288)
+        # =============================
+        pv = close * volume
 
-        if self.current_vwap_day != candle_day:
-            self.vwap_pv = 0
-            self.vwap_vol = 0
-            self.current_vwap_day = candle_day
+        if len(self.vwap_queue) == self.vwap_queue.maxlen:
+            old_pv, old_vol = self.vwap_queue[0]
+            self.vwap_pv_sum -= old_pv
+            self.vwap_vol_sum -= old_vol
 
-        self.vwap_pv += close * volume
-        self.vwap_vol += volume
+        self.vwap_queue.append((pv, volume))
+        self.vwap_pv_sum += pv
+        self.vwap_vol_sum += volume
 
-        vwap = self.vwap_pv / self.vwap_vol if self.vwap_vol > 0 else None
+        vwap = self.vwap_pv_sum / self.vwap_vol_sum if self.vwap_vol_sum > 0 else None
 
         self.prev_close = close
 
@@ -157,30 +160,23 @@ class ProBot:
 
     # =============================
     def preload_data(self):
-        log.info("📊 Preloading today's VWAP session data...")
+        log.info("📊 Preloading VWAP (288 candles)...")
 
         klines = self.client.futures_klines(
             symbol=SYMBOL,
             interval=INTERVAL,
-            limit=500
+            limit=VWAP_PERIOD
         )
 
-        today = datetime.now(timezone.utc).date()
-
         for k in klines:
-            candle_time = datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc)
-
-            if candle_time.date() != today:
-                continue
-
             close = float(k[4])
             high = float(k[2])
             low = float(k[3])
             volume = float(k[5])
 
-            self.update_indicators(close, high, low, volume, candle_time)
+            self.update_indicators(close, high, low, volume)
 
-        log.info("✅ VWAP preload complete (today only)")
+        log.info("✅ Preload complete")
 
     # =============================
     def place_trade(self, side, price, atr):
@@ -202,6 +198,7 @@ class ProBot:
         opposite = "SELL" if side == "BUY" else "BUY"
 
         try:
+            # ENTRY
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
@@ -227,22 +224,26 @@ class ProBot:
 
             log.info(f"{side} | Entry={entry:.2f} TP={tp:.2f} SL={sl:.2f}")
 
-            # ✅ FIXED SL (no reduceOnly)
+            # STOP LOSS
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
                 type="STOP_MARKET",
                 stopPrice=sl,
-                closePosition=True
+                quantity=qty,
+                reduceOnly=True,
+                workingType="MARK_PRICE"
             )
 
-            # ✅ FIXED TP (no reduceOnly)
+            # TAKE PROFIT
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
                 type="TAKE_PROFIT_MARKET",
                 stopPrice=tp,
-                closePosition=True
+                quantity=qty,
+                reduceOnly=True,
+                workingType="MARK_PRICE"
             )
 
             self.cooldown = COOLDOWN
@@ -275,18 +276,15 @@ class ProBot:
             if not k or not k.get("x"):
                 return
 
-            candle_time = datetime.fromtimestamp(k["t"] / 1000, tz=timezone.utc)
-
             close = float(k["c"])
             high = float(k["h"])
             low = float(k["l"])
             volume = float(k["v"])
 
             ema, atr, rsi, vwap = self.update_indicators(
-                close, high, low, volume, candle_time
+                close, high, low, volume
             )
 
-            # LIVE LOG
             log.info(
                 f"CLOSE={close:.2f} | "
                 f"EMA={round(ema,2) if ema else 'NA'} | "
