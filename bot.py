@@ -2,7 +2,7 @@ import os
 import time
 import csv
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
 
@@ -25,7 +25,7 @@ LEVERAGE = 3
 EMA_PERIOD = 198
 ATR_PERIOD = 14
 RSI_PERIOD = 14
-VWAP_PERIOD = 288   # ✅ 24h rolling VWAP
+VWAP_PERIOD = 288
 COOLDOWN = 2
 
 # =============================
@@ -57,7 +57,7 @@ class ProBot:
         self.tr_queue = deque(maxlen=ATR_PERIOD)
         self.rsi_queue = deque(maxlen=RSI_PERIOD)
 
-        # ✅ Rolling VWAP
+        # VWAP rolling
         self.vwap_queue = deque(maxlen=VWAP_PERIOD)
         self.vwap_pv_sum = 0
         self.vwap_vol_sum = 0
@@ -138,9 +138,7 @@ class ProBot:
         else:
             rsi = None
 
-        # =============================
-        # ✅ Rolling VWAP (288)
-        # =============================
+        # VWAP rolling
         pv = close * volume
 
         if len(self.vwap_queue) == self.vwap_queue.maxlen:
@@ -224,25 +222,29 @@ class ProBot:
 
             log.info(f"{side} | Entry={entry:.2f} TP={tp:.2f} SL={sl:.2f}")
 
-            # STOP LOSS
+            # STOP LOSS ✅ FINAL FIX
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
-                type="STOP_MARKET",
+                type="STOP",
+                price=sl,
                 stopPrice=sl,
                 quantity=qty,
                 reduceOnly=True,
+                timeInForce="GTC",
                 workingType="MARK_PRICE"
             )
 
-            # TAKE PROFIT
+            # TAKE PROFIT ✅ FINAL FIX
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
-                type="TAKE_PROFIT_MARKET",
+                type="TAKE_PROFIT",
+                price=tp,
                 stopPrice=tp,
                 quantity=qty,
                 reduceOnly=True,
+                timeInForce="GTC",
                 workingType="MARK_PRICE"
             )
 
@@ -266,14 +268,11 @@ class ProBot:
     # =============================
     def on_message(self, msg):
         try:
-            if not isinstance(msg, dict):
-                return
-
             if msg.get("e") != "kline":
                 return
 
-            k = msg.get("k")
-            if not k or not k.get("x"):
+            k = msg["k"]
+            if not k["x"]:
                 return
 
             close = float(k["c"])
@@ -281,13 +280,10 @@ class ProBot:
             low = float(k["l"])
             volume = float(k["v"])
 
-            ema, atr, rsi, vwap = self.update_indicators(
-                close, high, low, volume
-            )
+            ema, atr, rsi, vwap = self.update_indicators(close, high, low, volume)
 
             log.info(
-                f"CLOSE={close:.2f} | "
-                f"EMA={round(ema,2) if ema else 'NA'} | "
+                f"CLOSE={close:.2f} | EMA={round(ema,2) if ema else 'NA'} | "
                 f"RSI={round(rsi,2) if rsi else 'NA'} | "
                 f"VWAP={round(vwap,2) if vwap else 'NA'} | "
                 f"ATR={round(atr,2) if atr else 'NA'}"
@@ -299,7 +295,7 @@ class ProBot:
                 self.cooldown -= 1
 
         except Exception as e:
-            log.error(f"WS ERROR: {e} | MSG: {msg}")
+            log.error(f"WS ERROR: {e}")
 
     # =============================
     def run(self):
