@@ -2,7 +2,6 @@ import os
 import time
 import csv
 import logging
-from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
 
@@ -23,8 +22,8 @@ INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 3
 EMA_PERIOD = 198
-ATR_PERIOD = 14
-RSI_PERIOD = 14
+ATR_PERIOD = 15
+RSI_PERIOD = 15
 VWAP_PERIOD = 288
 COOLDOWN = 2
 
@@ -57,7 +56,6 @@ class ProBot:
         self.tr_queue = deque(maxlen=ATR_PERIOD)
         self.rsi_queue = deque(maxlen=RSI_PERIOD)
 
-        # VWAP rolling
         self.vwap_queue = deque(maxlen=VWAP_PERIOD)
         self.vwap_pv_sum = 0
         self.vwap_vol_sum = 0
@@ -65,15 +63,7 @@ class ProBot:
         self.cooldown = 0
         self.alpha = 2 / (EMA_PERIOD + 1)
 
-        self.csv_file = f"trades_{SYMBOL}.csv"
-
-        try:
-            with open(self.csv_file, "x", newline="") as f:
-                csv.writer(f).writerow(["time","side","entry","tp","sl","qty"])
-        except:
-            pass
-
-        # Precision
+        # precision
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
             if s["symbol"] == SYMBOL:
@@ -94,17 +84,11 @@ class ProBot:
         return float(Decimal(p).quantize(Decimal(str(self.tick)), ROUND_DOWN))
 
     def get_balance(self):
-        try:
-            return float(self.client.futures_account().get("availableBalance", 0))
-        except:
-            return 0
+        return float(self.client.futures_account()["availableBalance"])
 
     def get_position(self):
-        try:
-            pos = self.client.futures_position_information(symbol=SYMBOL)
-            return float(pos[0].get("positionAmt", 0)) if pos else 0
-        except:
-            return 0
+        pos = self.client.futures_position_information(symbol=SYMBOL)
+        return float(pos[0]["positionAmt"])
 
     # =============================
     def update_indicators(self, close, high, low, volume):
@@ -130,11 +114,7 @@ class ProBot:
         if len(self.rsi_queue) == RSI_PERIOD:
             gains = sum(x for x in self.rsi_queue if x > 0)
             losses = abs(sum(x for x in self.rsi_queue if x < 0))
-            if losses == 0:
-                rsi = 100
-            else:
-                rs = gains / losses
-                rsi = 100 - (100 / (1 + rs))
+            rsi = 100 if losses == 0 else 100 - (100 / (1 + gains / losses))
         else:
             rsi = None
 
@@ -194,6 +174,7 @@ class ProBot:
             return
 
         opposite = "SELL" if side == "BUY" else "BUY"
+        position_side = "LONG" if side == "BUY" else "SHORT"
 
         try:
             # ENTRY
@@ -201,18 +182,14 @@ class ProBot:
                 symbol=SYMBOL,
                 side=side,
                 type="MARKET",
-                quantity=qty
+                quantity=qty,
+                positionSide=position_side
             )
 
             time.sleep(0.5)
 
             pos = self.client.futures_position_information(symbol=SYMBOL)
-            if not pos:
-                return
-
-            entry = float(pos[0].get("entryPrice", 0))
-            if entry == 0:
-                return
+            entry = float(pos[0]['entryPrice'])
 
             sl = entry - atr if side == "BUY" else entry + atr
             tp = entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5
@@ -222,29 +199,27 @@ class ProBot:
 
             log.info(f"{side} | Entry={entry:.2f} TP={tp:.2f} SL={sl:.2f}")
 
-            # STOP LOSS ✅ FINAL FIX
+            # STOP LOSS
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
-                type="STOP",
-                price=sl,
+                type="STOP_MARKET",
                 stopPrice=sl,
                 quantity=qty,
                 reduceOnly=True,
-                timeInForce="GTC",
+                positionSide=position_side,
                 workingType="MARK_PRICE"
             )
 
-            # TAKE PROFIT ✅ FINAL FIX
+            # TAKE PROFIT
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
-                type="TAKE_PROFIT",
-                price=tp,
+                type="TAKE_PROFIT_MARKET",
                 stopPrice=tp,
                 quantity=qty,
                 reduceOnly=True,
-                timeInForce="GTC",
+                positionSide=position_side,
                 workingType="MARK_PRICE"
             )
 
@@ -299,7 +274,6 @@ class ProBot:
 
     # =============================
     def run(self):
-
         self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
         self.preload_data()
