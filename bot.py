@@ -1,6 +1,8 @@
 import os
 import time
+import csv
 import logging
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
 
@@ -55,10 +57,23 @@ class ProBot:
         self.vol_queue = deque(maxlen=VOL_WINDOW)
 
         self.cooldown = 0
-
         self.alpha = 2 / (EMA_PERIOD + 1)
 
-        # ✅ Dynamic precision
+        # =============================
+        # CSV LOGGING
+        # =============================
+        self.csv_file = f"trades_{SYMBOL}.csv"
+
+        try:
+            with open(self.csv_file, "x", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["time", "side", "entry", "tp", "sl", "qty"])
+        except FileExistsError:
+            pass
+
+        # =============================
+        # Exchange precision
+        # =============================
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
             if s["symbol"] == SYMBOL:
@@ -68,6 +83,22 @@ class ProBot:
                     if f["filterType"] == "PRICE_FILTER":
                         self.tick = float(f["tickSize"])
                 break
+
+    # =============================
+    def log_trade(self, side, entry, tp, sl, qty):
+        try:
+            with open(self.csv_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    side,
+                    entry,
+                    tp,
+                    sl,
+                    qty
+                ])
+        except Exception as e:
+            log.error(f"CSV log error: {e}")
 
     # =============================
     def round_qty(self, q):
@@ -82,7 +113,6 @@ class ProBot:
         except:
             return 0
 
-    # ✅ FIXED (no crash)
     def get_position(self):
         try:
             positions = self.client.futures_position_information(symbol=SYMBOL)
@@ -209,7 +239,6 @@ class ProBot:
 
             time.sleep(0.5)
 
-            # ✅ SAFE entry fetch
             entry = 0
             positions = self.client.futures_position_information(symbol=SYMBOL)
             for p in positions:
@@ -226,7 +255,10 @@ class ProBot:
             sl = self.round_price(sl)
             tp = self.round_price(tp)
 
-            log.info(f"{side} @ {entry} | TP={tp} SL={sl}")
+            log.info(f"{side} EXECUTED | Entry={entry} | TP={tp} SL={sl} | QTY={qty}")
+
+            # CSV log
+            self.log_trade(side, entry, tp, sl, qty)
 
             # SL
             self.client.futures_create_order(
