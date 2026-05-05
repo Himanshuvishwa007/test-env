@@ -20,10 +20,9 @@ SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 3
-RISK_PCT = 0.2   # 🔥 reduced (important for small capital)
+RISK_PCT = 0.2
 
 EMA_PERIOD = 50
-RSI_PERIOD = 14
 ATR_PERIOD = 14
 
 VWAP_WINDOW = 50
@@ -56,11 +55,10 @@ class ProBot:
         self.vol_queue = deque(maxlen=VOL_WINDOW)
 
         self.cooldown = 0
-        self.in_position = False
 
         self.alpha = 2 / (EMA_PERIOD + 1)
 
-        # 🔥 Fetch exchange precision dynamically
+        # ✅ Dynamic precision
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
             if s["symbol"] == SYMBOL:
@@ -79,12 +77,28 @@ class ProBot:
         return float(Decimal(p).quantize(Decimal(str(self.tick)), ROUND_DOWN))
 
     def get_balance(self):
-        return float(self.client.futures_account()["availableBalance"])
+        try:
+            return float(self.client.futures_account()["availableBalance"])
+        except:
+            return 0
 
+    # ✅ FIXED (no crash)
     def get_position(self):
-        pos = self.client.futures_position_information(symbol=SYMBOL)[0]
-        qty = float(pos["positionAmt"])
-        return qty
+        try:
+            positions = self.client.futures_position_information(symbol=SYMBOL)
+
+            if not positions:
+                return 0
+
+            for pos in positions:
+                if pos["symbol"] == SYMBOL:
+                    return float(pos["positionAmt"])
+
+            return 0
+
+        except Exception as e:
+            log.error(f"Position error: {e}")
+            return 0
 
     # =============================
     def load_history(self):
@@ -163,7 +177,7 @@ class ProBot:
 
         qty = self.round_qty(effective / price)
 
-        if qty * price < 10:  # safer min
+        if qty * price < 10:
             return None
 
         return qty
@@ -186,17 +200,25 @@ class ProBot:
         opposite = "SELL" if side == "BUY" else "BUY"
 
         try:
-            order = self.client.futures_create_order(
+            self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
                 type="MARKET",
                 quantity=qty
             )
 
-            # 🔥 Get real entry from position (not order)
             time.sleep(0.5)
-            pos = self.client.futures_position_information(symbol=SYMBOL)[0]
-            entry = float(pos["entryPrice"])
+
+            # ✅ SAFE entry fetch
+            entry = 0
+            positions = self.client.futures_position_information(symbol=SYMBOL)
+            for p in positions:
+                if p["symbol"] == SYMBOL:
+                    entry = float(p["entryPrice"])
+
+            if entry == 0:
+                log.error("Entry price not found")
+                return
 
             sl = entry - atr if side == "BUY" else entry + atr
             tp = entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5
@@ -249,25 +271,28 @@ class ProBot:
 
     # =============================
     def on_message(self, msg):
+        try:
+            if msg["e"] != "kline":
+                return
 
-        if msg["e"] != "kline":
-            return
+            k = msg["k"]
+            if not k["x"]:
+                return
 
-        k = msg["k"]
-        if not k["x"]:
-            return
+            ema, rsi, atr, vwap, volume_spike = self.update_indicators(
+                float(k["c"]),
+                float(k["h"]),
+                float(k["l"]),
+                float(k["v"])
+            )
 
-        ema, rsi, atr, vwap, volume_spike = self.update_indicators(
-            float(k["c"]),
-            float(k["h"]),
-            float(k["l"]),
-            float(k["v"])
-        )
+            self.strategy(float(k["c"]), ema, rsi, atr, vwap, volume_spike)
 
-        self.strategy(float(k["c"]), ema, rsi, atr, vwap, volume_spike)
+            if self.cooldown > 0:
+                self.cooldown -= 1
 
-        if self.cooldown > 0:
-            self.cooldown -= 1
+        except Exception as e:
+            log.error(f"WS ERROR: {e}")
 
     # =============================
     def run(self):
