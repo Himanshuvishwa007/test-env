@@ -227,21 +227,21 @@ class ProBot:
 
             log.info(f"{side} | Entry={entry:.2f} TP={tp:.2f} SL={sl:.2f}")
 
+            # ✅ FIXED SL (no reduceOnly)
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
                 type="STOP_MARKET",
                 stopPrice=sl,
-                reduceOnly=True,
                 closePosition=True
             )
 
+            # ✅ FIXED TP (no reduceOnly)
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=opposite,
                 type="TAKE_PROFIT_MARKET",
                 stopPrice=tp,
-                reduceOnly=True,
                 closePosition=True
             )
 
@@ -286,7 +286,7 @@ class ProBot:
                 close, high, low, volume, candle_time
             )
 
-            # 🔥 LIVE LOG EVERY CANDLE
+            # LIVE LOG
             log.info(
                 f"CLOSE={close:.2f} | "
                 f"EMA={round(ema,2) if ema else 'NA'} | "
@@ -325,6 +325,5 @@ class ProBot:
             time.sleep(1)
 
 
-# =============================
 if __name__ == "__main__":
     ProBot().run()
