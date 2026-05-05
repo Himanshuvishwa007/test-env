@@ -1,8 +1,12 @@
 import os
 import time
+import hmac
+import hashlib
 import logging
+import requests
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
+from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 from binance.client import Client
@@ -26,18 +30,17 @@ RSI_PERIOD = 15
 VWAP_PERIOD = 288
 COOLDOWN = 2
 
+BASE_URL = "https://fapi.binance.com"
+
 # =============================
 # LOGGING
 # =============================
 log = logging.getLogger()
 log.setLevel(logging.INFO)
-
 formatter = logging.Formatter("%(asctime)s | %(message)s")
-
 console = logging.StreamHandler()
 console.setFormatter(formatter)
 log.addHandler(console)
-
 file_handler = logging.FileHandler("bot.log")
 file_handler.setFormatter(formatter)
 log.addHandler(file_handler)
@@ -51,15 +54,12 @@ class ProBot:
 
         self.ema = None
         self.prev_close = None
-
         self.atr = None
         self.tr_queue = deque(maxlen=ATR_PERIOD)
         self.rsi_queue = deque(maxlen=RSI_PERIOD)
-
         self.vwap_queue = deque(maxlen=VWAP_PERIOD)
         self.vwap_pv_sum = 0
         self.vwap_vol_sum = 0
-
         self.cooldown = 0
         self.alpha = 2 / (EMA_PERIOD + 1)
 
@@ -87,13 +87,70 @@ class ProBot:
         return float(self.client.futures_account()["availableBalance"])
 
     def get_position(self):
-        """Returns current position amount. Positive = LONG, Negative = SHORT, 0 = flat."""
+        """Returns position amount. Positive=LONG, Negative=SHORT, 0=flat."""
         pos = self.client.futures_position_information(symbol=SYMBOL)
         for p in pos:
             amt = float(p["positionAmt"])
             if amt != 0:
                 return amt
         return 0.0
+
+    # =============================
+    def _sign_request(self, params: dict) -> dict:
+        """Add timestamp and HMAC-SHA256 signature to params."""
+        params["timestamp"] = int(time.time() * 1000)
+        query = urlencode(params)
+        sig = hmac.new(
+            API_SECRET.encode("utf-8"),
+            query.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        params["signature"] = sig
+        return params
+
+    def place_algo_order(self, side, order_type, trigger_price, qty):
+        """
+        Call /fapi/v1/algoOrder directly — required for STOP_MARKET / TAKE_PROFIT_MARKET.
+        One-way mode: no positionSide, use reduceOnly=true.
+        """
+        params = {
+            "symbol": SYMBOL,
+            "side": side,
+            "type": order_type,           # STOP_MARKET or TAKE_PROFIT_MARKET
+            "algoType": "CONDITIONAL",
+            "quantity": str(qty),
+            "triggerPrice": str(trigger_price),
+            "workingType": "MARK_PRICE",
+            "reduceOnly": "true",
+            "timeInForce": "GTC",
+        }
+        params = self._sign_request(params)
+
+        resp = requests.post(
+            f"{BASE_URL}/fapi/v1/algoOrder",
+            headers={"X-MBX-APIKEY": API_KEY},
+            params=params,
+            timeout=10
+        )
+        data = resp.json()
+
+        if resp.status_code != 200 or "algoId" not in data:
+            raise Exception(f"Algo order failed: {data}")
+
+        return data
+
+    def cancel_algo_orders(self):
+        """Cancel all open algo orders."""
+        try:
+            params = self._sign_request({"symbol": SYMBOL})
+            requests.delete(
+                f"{BASE_URL}/fapi/v1/allOpenOrders",
+                headers={"X-MBX-APIKEY": API_KEY},
+                params=params,
+                timeout=10
+            )
+        except Exception as e:
+            log.warning(f"Cancel algo orders warning: {e}")
 
     # =============================
     def update_indicators(self, close, high, low, volume):
@@ -103,19 +160,15 @@ class ProBot:
             self.prev_close = close
             return None, None, None, None
 
-        # EMA
         self.ema += self.alpha * (close - self.ema)
 
-        # ATR
         tr = max(high - low, abs(high - self.prev_close), abs(low - self.prev_close))
         self.tr_queue.append(tr)
         if len(self.tr_queue) == ATR_PERIOD:
             self.atr = sum(self.tr_queue) / ATR_PERIOD
 
-        # RSI
         change = close - self.prev_close
         self.rsi_queue.append(change)
-
         if len(self.rsi_queue) == RSI_PERIOD:
             gains = sum(x for x in self.rsi_queue if x > 0)
             losses = abs(sum(x for x in self.rsi_queue if x < 0))
@@ -123,59 +176,34 @@ class ProBot:
         else:
             rsi = None
 
-        # VWAP rolling
         pv = close * volume
-
         if len(self.vwap_queue) == self.vwap_queue.maxlen:
             old_pv, old_vol = self.vwap_queue[0]
             self.vwap_pv_sum -= old_pv
             self.vwap_vol_sum -= old_vol
-
         self.vwap_queue.append((pv, volume))
         self.vwap_pv_sum += pv
         self.vwap_vol_sum += volume
-
         vwap = self.vwap_pv_sum / self.vwap_vol_sum if self.vwap_vol_sum > 0 else None
 
         self.prev_close = close
-
         return self.ema, self.atr, rsi, vwap
 
     # =============================
     def preload_data(self):
         log.info("📊 Preloading VWAP (288 candles)...")
-
-        klines = self.client.futures_klines(
-            symbol=SYMBOL,
-            interval=INTERVAL,
-            limit=VWAP_PERIOD
-        )
-
+        klines = self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=VWAP_PERIOD)
         for k in klines:
-            close = float(k[4])
-            high = float(k[2])
-            low = float(k[3])
-            volume = float(k[5])
-
-            self.update_indicators(close, high, low, volume)
-
+            self.update_indicators(float(k[4]), float(k[2]), float(k[3]), float(k[5]))
         log.info("✅ Preload complete")
 
     # =============================
-    def cancel_open_orders(self):
-        try:
-            self.client.futures_cancel_all_open_orders(symbol=SYMBOL)
-        except Exception as e:
-            log.warning(f"Cancel orders warning: {e}")
-
     def place_trade(self, side, price, atr):
 
         if self.cooldown > 0:
             return
-
         if self.get_position() != 0:
             return
-
         if atr is None or atr <= 0:
             return
 
@@ -187,11 +215,10 @@ class ProBot:
         if qty * price < self.min_notional:
             return
 
-        # One-way mode: closing side is opposite of entry
         close_side = "SELL" if side == "BUY" else "BUY"
 
         try:
-            # ── ENTRY ──────────────────────────────────────────
+            # ── ENTRY (regular endpoint, market order) ──────────
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
@@ -201,7 +228,7 @@ class ProBot:
 
             time.sleep(0.5)
 
-            # Fetch actual entry price
+            # Fetch actual fill price
             pos = self.client.futures_position_information(symbol=SYMBOL)
             entry = None
             for p in pos:
@@ -218,44 +245,24 @@ class ProBot:
 
             log.info(f"{side} | Entry={entry:.2f} | TP={tp:.2f} | SL={sl:.2f} | Qty={qty}")
 
-            # ── STOP LOSS ───────────────────────────────────────
-            # One-way mode: reduceOnly=True, NO positionSide
-            self.client.futures_create_order(
-                symbol=SYMBOL,
-                side=close_side,
-                type="STOP_MARKET",
-                stopPrice=sl,
-                quantity=qty,
-                reduceOnly=True,
-                workingType="MARK_PRICE"
-            )
+            # ── STOP LOSS via Algo endpoint ─────────────────────
+            self.place_algo_order(close_side, "STOP_MARKET", sl, qty)
 
-            # ── TAKE PROFIT ─────────────────────────────────────
-            self.client.futures_create_order(
-                symbol=SYMBOL,
-                side=close_side,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=tp,
-                quantity=qty,
-                reduceOnly=True,
-                workingType="MARK_PRICE"
-            )
+            # ── TAKE PROFIT via Algo endpoint ───────────────────
+            self.place_algo_order(close_side, "TAKE_PROFIT_MARKET", tp, qty)
 
             self.cooldown = COOLDOWN
 
         except Exception as e:
             log.error(f"TRADE ERROR: {e}")
-            self.cancel_open_orders()
+            self.cancel_algo_orders()
 
     # =============================
     def strategy(self, close, ema, atr, rsi, vwap):
-
         if None in (ema, atr, rsi, vwap):
             return
-
         if close > ema and close > vwap and rsi > 50:
             self.place_trade("BUY", close, atr)
-
         elif close < ema and close < vwap and rsi < 50:
             self.place_trade("SELL", close, atr)
 
@@ -264,7 +271,6 @@ class ProBot:
         try:
             if msg.get("e") != "kline":
                 return
-
             k = msg["k"]
             if not k["x"]:
                 return
@@ -294,20 +300,13 @@ class ProBot:
     # =============================
     def run(self):
         self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-
         self.preload_data()
 
         twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
         twm.start()
-
-        twm.start_kline_socket(
-            callback=self.on_message,
-            symbol=SYMBOL,
-            interval=INTERVAL
-        )
+        twm.start_kline_socket(callback=self.on_message, symbol=SYMBOL, interval=INTERVAL)
 
         log.info("🚀 BOT STARTED")
-
         while True:
             time.sleep(1)
 
