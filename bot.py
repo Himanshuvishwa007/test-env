@@ -22,7 +22,6 @@ SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 3
-RISK_PCT = 0.2
 
 EMA_PERIOD = 50
 ATR_PERIOD = 14
@@ -59,9 +58,6 @@ class ProBot:
         self.cooldown = 0
         self.alpha = 2 / (EMA_PERIOD + 1)
 
-        # =============================
-        # CSV LOGGING
-        # =============================
         self.csv_file = f"trades_{SYMBOL}.csv"
 
         try:
@@ -82,6 +78,8 @@ class ProBot:
                         self.step = float(f["stepSize"])
                     if f["filterType"] == "PRICE_FILTER":
                         self.tick = float(f["tickSize"])
+                    if f["filterType"] == "MIN_NOTIONAL":
+                        self.min_notional = float(f["notional"])
                 break
 
     # =============================
@@ -107,25 +105,21 @@ class ProBot:
     def round_price(self, p):
         return float(Decimal(p).quantize(Decimal(str(self.tick)), ROUND_DOWN))
 
+    # =============================
     def get_balance(self):
         try:
             return float(self.client.futures_account()["availableBalance"])
-        except:
+        except Exception as e:
+            log.error(f"Balance error: {e}")
             return 0
 
     def get_position(self):
         try:
             positions = self.client.futures_position_information(symbol=SYMBOL)
-
-            if not positions:
-                return 0
-
             for pos in positions:
                 if pos["symbol"] == SYMBOL:
                     return float(pos["positionAmt"])
-
             return 0
-
         except Exception as e:
             log.error(f"Position error: {e}")
             return 0
@@ -203,11 +197,18 @@ class ProBot:
     # =============================
     def get_qty(self, price):
         balance = self.get_balance()
-        effective = balance * RISK_PCT * LEVERAGE
 
-        qty = self.round_qty(effective / price)
+        if balance < 5:
+            log.warning(f"Too low balance: {balance}")
+            return None
 
-        if qty * price < 10:
+        usable_balance = balance * 0.95
+        notional = usable_balance * LEVERAGE
+
+        qty = self.round_qty(notional / price)
+
+        if qty * price < self.min_notional:
+            log.warning(f"Below min notional | Qty={qty} Value={qty*price}")
             return None
 
         return qty
@@ -224,13 +225,13 @@ class ProBot:
 
         qty = self.get_qty(price)
         if qty is None:
-            log.info("Low balance")
+            log.info("Trade skipped (low balance or min notional)")
             return
 
         opposite = "SELL" if side == "BUY" else "BUY"
 
         try:
-            self.client.futures_create_order(
+            order = self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
                 type="MARKET",
@@ -239,15 +240,7 @@ class ProBot:
 
             time.sleep(0.5)
 
-            entry = 0
-            positions = self.client.futures_position_information(symbol=SYMBOL)
-            for p in positions:
-                if p["symbol"] == SYMBOL:
-                    entry = float(p["entryPrice"])
-
-            if entry == 0:
-                log.error("Entry price not found")
-                return
+            entry = float(order["avgPrice"]) if "avgPrice" in order else price
 
             sl = entry - atr if side == "BUY" else entry + atr
             tp = entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5
@@ -257,7 +250,6 @@ class ProBot:
 
             log.info(f"{side} EXECUTED | Entry={entry} | TP={tp} SL={sl} | QTY={qty}")
 
-            # CSV log
             self.log_trade(side, entry, tp, sl, qty)
 
             # SL
@@ -283,7 +275,10 @@ class ProBot:
             self.cooldown = COOLDOWN
 
         except Exception as e:
-            log.error(f"Trade error: {e}")
+            if hasattr(e, 'code'):
+                log.error(f"Binance Error {e.code}: {e.message}")
+            else:
+                log.error(f"Trade error: {e}")
 
     # =============================
     def strategy(self, close, ema, rsi, atr, vwap, volume_spike):
@@ -295,10 +290,11 @@ class ProBot:
 
         log.info(f"C={close:.2f} EMA={ema:.2f} RSI={rsi:.1f} VWAP={vwap:.2f}")
 
-        if close > ema and 45 < rsi < 55 and near_vwap and volume_spike:
+        # Slightly relaxed condition
+        if close > ema and 40 < rsi < 60 and near_vwap:
             self.place_trade("BUY", close, atr)
 
-        elif close < ema and 45 < rsi < 55 and near_vwap and volume_spike:
+        elif close < ema and 40 < rsi < 60 and near_vwap:
             self.place_trade("SELL", close, atr)
 
     # =============================
