@@ -312,9 +312,14 @@ class ProBot:
     def strategy(self, close, ema, atr, rsi, vwap):
         if None in (ema, atr, rsi, vwap):
             return
-        if close > ema and close > vwap and rsi > 50:
+
+        # Mean reversion — same as paper strategy
+        # LONG: price above EMA, slightly below VWAP (within 0.2%), RSI weak
+        if close > ema and close < vwap * 1.002 and rsi < 45:
             self.place_trade("BUY", close, atr)
-        elif close < ema and close < vwap and rsi < 50:
+
+        # SHORT: price below EMA, slightly above VWAP (within 0.2%), RSI strong
+        elif close < ema and close > vwap * 0.998 and rsi > 55:
             self.place_trade("SELL", close, atr)
 
     # =============================
