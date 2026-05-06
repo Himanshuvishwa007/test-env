@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import logging
 import requests
+import threading
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
 from urllib.parse import urlencode
@@ -63,6 +64,15 @@ class ProBot:
         self.cooldown = 0
         self.alpha = 2 / (EMA_PERIOD + 1)
 
+        # Track open algo order IDs so we can cancel the orphan
+        self.sl_algo_id = None
+        self.tp_algo_id = None
+
+        # Internal position state — updated by monitor thread
+        # True means we believe we are IN a trade right now
+        self.in_trade = False
+        self._trade_lock = threading.Lock()
+
         # precision
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
@@ -88,16 +98,18 @@ class ProBot:
 
     def get_position(self):
         """Returns position amount. Positive=LONG, Negative=SHORT, 0=flat."""
-        pos = self.client.futures_position_information(symbol=SYMBOL)
-        for p in pos:
-            amt = float(p["positionAmt"])
-            if amt != 0:
-                return amt
+        try:
+            pos = self.client.futures_position_information(symbol=SYMBOL)
+            for p in pos:
+                amt = float(p["positionAmt"])
+                if amt != 0:
+                    return amt
+        except Exception as e:
+            log.warning(f"get_position error: {e}")
         return 0.0
 
     # =============================
     def _sign_request(self, params: dict) -> dict:
-        """Add timestamp and HMAC-SHA256 signature to params."""
         params["timestamp"] = int(time.time() * 1000)
         query = urlencode(params)
         sig = hmac.new(
@@ -109,14 +121,11 @@ class ProBot:
         return params
 
     def place_algo_order(self, side, order_type, trigger_price, qty):
-        """
-        Call /fapi/v1/algoOrder directly — required for STOP_MARKET / TAKE_PROFIT_MARKET.
-        One-way mode: no positionSide, use reduceOnly=true.
-        """
+        """POST to /fapi/v1/algoOrder. Returns algoId."""
         params = {
             "symbol": SYMBOL,
             "side": side,
-            "type": order_type,           # STOP_MARKET or TAKE_PROFIT_MARKET
+            "type": order_type,
             "algoType": "CONDITIONAL",
             "quantity": str(qty),
             "triggerPrice": str(trigger_price),
@@ -125,7 +134,6 @@ class ProBot:
             "timeInForce": "GTC",
         }
         params = self._sign_request(params)
-
         resp = requests.post(
             f"{BASE_URL}/fapi/v1/algoOrder",
             headers={"X-MBX-APIKEY": API_KEY},
@@ -133,24 +141,54 @@ class ProBot:
             timeout=10
         )
         data = resp.json()
-
         if resp.status_code != 200 or "algoId" not in data:
             raise Exception(f"Algo order failed: {data}")
+        return data["algoId"]
 
-        return data
-
-    def cancel_algo_orders(self):
-        """Cancel all open algo orders."""
+    def cancel_algo_order(self, algo_id):
+        """Cancel a specific algo order by ID."""
         try:
-            params = self._sign_request({"symbol": SYMBOL})
-            requests.delete(
-                f"{BASE_URL}/fapi/v1/allOpenOrders",
+            params = self._sign_request({"symbol": SYMBOL, "algoId": algo_id})
+            resp = requests.delete(
+                f"{BASE_URL}/fapi/v1/algoOrder",
                 headers={"X-MBX-APIKEY": API_KEY},
                 params=params,
                 timeout=10
             )
+            data = resp.json()
+            log.info(f"Cancelled algo order {algo_id}: {data.get('algoStatus', data)}")
         except Exception as e:
-            log.warning(f"Cancel algo orders warning: {e}")
+            log.warning(f"Cancel algo order {algo_id} error: {e}")
+
+    def cancel_all_algo_orders(self):
+        """Cancel both tracked SL and TP algo orders."""
+        if self.sl_algo_id:
+            self.cancel_algo_order(self.sl_algo_id)
+            self.sl_algo_id = None
+        if self.tp_algo_id:
+            self.cancel_algo_order(self.tp_algo_id)
+            self.tp_algo_id = None
+
+    # =============================
+    def position_monitor(self):
+        """
+        Background thread — polls position every 3s.
+        When position goes flat after being in a trade:
+        - cancels the orphan algo order (the one that didn't trigger)
+        - resets in_trade flag so bot can take next signal
+        """
+        log.info("🔍 Position monitor started")
+        while True:
+            try:
+                amt = self.get_position()
+                with self._trade_lock:
+                    if self.in_trade and amt == 0:
+                        log.info("✅ Position closed — cancelling orphan algo orders")
+                        self.cancel_all_algo_orders()
+                        self.in_trade = False
+            except Exception as e:
+                log.warning(f"Monitor error: {e}")
+            time.sleep(3)
 
     # =============================
     def update_indicators(self, close, high, low, volume):
@@ -200,11 +238,20 @@ class ProBot:
     # =============================
     def place_trade(self, side, price, atr):
 
-        if self.cooldown > 0:
-            return
-        if self.get_position() != 0:
-            return
+        with self._trade_lock:
+            # Block if already in a trade — monitor thread is the only thing that clears this
+            if self.in_trade:
+                return
+            if self.cooldown > 0:
+                return
+
         if atr is None or atr <= 0:
+            return
+
+        # Double-check actual position from exchange (safety net)
+        if self.get_position() != 0:
+            with self._trade_lock:
+                self.in_trade = True  # sync state
             return
 
         balance = self.get_balance()
@@ -218,7 +265,7 @@ class ProBot:
         close_side = "SELL" if side == "BUY" else "BUY"
 
         try:
-            # ── ENTRY (regular endpoint, market order) ──────────
+            # ── ENTRY ───────────────────────────────────────────
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
@@ -246,16 +293,20 @@ class ProBot:
             log.info(f"{side} | Entry={entry:.2f} | TP={tp:.2f} | SL={sl:.2f} | Qty={qty}")
 
             # ── STOP LOSS via Algo endpoint ─────────────────────
-            self.place_algo_order(close_side, "STOP_MARKET", sl, qty)
+            self.sl_algo_id = self.place_algo_order(close_side, "STOP_MARKET", sl, qty)
+            log.info(f"SL algo order placed: ID={self.sl_algo_id}")
 
             # ── TAKE PROFIT via Algo endpoint ───────────────────
-            self.place_algo_order(close_side, "TAKE_PROFIT_MARKET", tp, qty)
+            self.tp_algo_id = self.place_algo_order(close_side, "TAKE_PROFIT_MARKET", tp, qty)
+            log.info(f"TP algo order placed: ID={self.tp_algo_id}")
 
-            self.cooldown = COOLDOWN
+            with self._trade_lock:
+                self.in_trade = True
+                self.cooldown = COOLDOWN
 
         except Exception as e:
             log.error(f"TRADE ERROR: {e}")
-            self.cancel_algo_orders()
+            self.cancel_all_algo_orders()
 
     # =============================
     def strategy(self, close, ema, atr, rsi, vwap):
@@ -286,7 +337,8 @@ class ProBot:
                 f"CLOSE={close:.2f} | EMA={round(ema,2) if ema else 'NA'} | "
                 f"RSI={round(rsi,2) if rsi else 'NA'} | "
                 f"VWAP={round(vwap,2) if vwap else 'NA'} | "
-                f"ATR={round(atr,2) if atr else 'NA'}"
+                f"ATR={round(atr,2) if atr else 'NA'} | "
+                f"IN_TRADE={self.in_trade}"
             )
 
             self.strategy(close, ema, atr, rsi, vwap)
@@ -301,6 +353,10 @@ class ProBot:
     def run(self):
         self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
         self.preload_data()
+
+        # Start position monitor in background
+        monitor = threading.Thread(target=self.position_monitor, daemon=True)
+        monitor.start()
 
         twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
         twm.start()
