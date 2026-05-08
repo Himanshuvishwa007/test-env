@@ -64,12 +64,9 @@ class ProBot:
         self.cooldown = 0
         self.alpha = 2 / (EMA_PERIOD + 1)
 
-        # Track open algo order IDs so we can cancel the orphan
         self.sl_algo_id = None
         self.tp_algo_id = None
 
-        # Internal position state — updated by monitor thread
-        # True means we believe we are IN a trade right now
         self.in_trade = False
         self._trade_lock = threading.Lock()
 
@@ -97,7 +94,6 @@ class ProBot:
         return float(self.client.futures_account()["availableBalance"])
 
     def get_position(self):
-        """Returns position amount. Positive=LONG, Negative=SHORT, 0=flat."""
         try:
             pos = self.client.futures_position_information(symbol=SYMBOL)
             for p in pos:
@@ -121,7 +117,6 @@ class ProBot:
         return params
 
     def place_algo_order(self, side, order_type, trigger_price, qty):
-        """POST to /fapi/v1/algoOrder. Returns algoId."""
         params = {
             "symbol": SYMBOL,
             "side": side,
@@ -146,7 +141,6 @@ class ProBot:
         return data["algoId"]
 
     def cancel_algo_order(self, algo_id):
-        """Cancel a specific algo order by ID."""
         try:
             params = self._sign_request({"symbol": SYMBOL, "algoId": algo_id})
             resp = requests.delete(
@@ -161,7 +155,6 @@ class ProBot:
             log.warning(f"Cancel algo order {algo_id} error: {e}")
 
     def cancel_all_algo_orders(self):
-        """Cancel both tracked SL and TP algo orders."""
         if self.sl_algo_id:
             self.cancel_algo_order(self.sl_algo_id)
             self.sl_algo_id = None
@@ -171,12 +164,6 @@ class ProBot:
 
     # =============================
     def position_monitor(self):
-        """
-        Background thread — polls position every 3s.
-        When position goes flat after being in a trade:
-        - cancels the orphan algo order (the one that didn't trigger)
-        - resets in_trade flag so bot can take next signal
-        """
         log.info("🔍 Position monitor started")
         while True:
             try:
@@ -239,7 +226,6 @@ class ProBot:
     def place_trade(self, side, price, atr):
 
         with self._trade_lock:
-            # Block if already in a trade — monitor thread is the only thing that clears this
             if self.in_trade:
                 return
             if self.cooldown > 0:
@@ -248,10 +234,9 @@ class ProBot:
         if atr is None or atr <= 0:
             return
 
-        # Double-check actual position from exchange (safety net)
         if self.get_position() != 0:
             with self._trade_lock:
-                self.in_trade = True  # sync state
+                self.in_trade = True
             return
 
         balance = self.get_balance()
@@ -265,7 +250,6 @@ class ProBot:
         close_side = "SELL" if side == "BUY" else "BUY"
 
         try:
-            # ── ENTRY ───────────────────────────────────────────
             self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
@@ -275,7 +259,6 @@ class ProBot:
 
             time.sleep(0.5)
 
-            # Fetch actual fill price
             pos = self.client.futures_position_information(symbol=SYMBOL)
             entry = None
             for p in pos:
@@ -292,11 +275,9 @@ class ProBot:
 
             log.info(f"{side} | Entry={entry:.2f} | TP={tp:.2f} | SL={sl:.2f} | Qty={qty}")
 
-            # ── STOP LOSS via Algo endpoint ─────────────────────
             self.sl_algo_id = self.place_algo_order(close_side, "STOP_MARKET", sl, qty)
             log.info(f"SL algo order placed: ID={self.sl_algo_id}")
 
-            # ── TAKE PROFIT via Algo endpoint ───────────────────
             self.tp_algo_id = self.place_algo_order(close_side, "TAKE_PROFIT_MARKET", tp, qty)
             log.info(f"TP algo order placed: ID={self.tp_algo_id}")
 
@@ -363,13 +344,38 @@ class ProBot:
         monitor = threading.Thread(target=self.position_monitor, daemon=True)
         monitor.start()
 
-        twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
-        twm.start()
-        twm.start_kline_socket(callback=self.on_message, symbol=SYMBOL, interval=INTERVAL)
-
         log.info("🚀 BOT STARTED")
+
+        # Auto-reconnect loop — restarts WebSocket if Binance drops connection
         while True:
-            time.sleep(1)
+            twm = None
+            try:
+                twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
+                twm.start()
+                twm.start_kline_socket(
+                    callback=self.on_message,
+                    symbol=SYMBOL,
+                    interval=INTERVAL
+                )
+                log.info("🔌 WebSocket connected")
+
+                # Keep alive — check every 5s if still running
+                while twm.is_alive():
+                    time.sleep(5)
+
+                log.warning("⚠️ WebSocket dropped — reconnecting in 5s...")
+
+            except Exception as e:
+                log.error(f"WebSocket error: {e} — reconnecting in 5s...")
+
+            finally:
+                try:
+                    if twm:
+                        twm.stop()
+                except Exception:
+                    pass
+
+            time.sleep(5)
 
 
 if __name__ == "__main__":
