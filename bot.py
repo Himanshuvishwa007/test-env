@@ -318,6 +318,7 @@ class ProBot:
             volume = float(k["v"])
 
             ema, atr, rsi, vwap = self.update_indicators(close, high, low, volume)
+            self.last_candle_time = time.time()  # watchdog heartbeat
 
             log.info(
                 f"CLOSE={close:.2f} | EMA={round(ema,2) if ema else 'NA'} | "
@@ -346,7 +347,11 @@ class ProBot:
 
         log.info("🚀 BOT STARTED")
 
-        # Auto-reconnect loop — restarts WebSocket if Binance drops connection
+        # Watchdog: if no candle received in 15 min — force reconnect
+        # 5-min candles should arrive every 5 min; 15 min = 3 missed candles
+        self.last_candle_time = time.time()
+        WATCHDOG_TIMEOUT = 15 * 60
+
         while True:
             twm = None
             try:
@@ -359,11 +364,16 @@ class ProBot:
                 )
                 log.info("🔌 WebSocket connected")
 
-                # Keep alive — check every 5s if still running
-                while twm.is_alive():
-                    time.sleep(5)
-
-                log.warning("⚠️ WebSocket dropped — reconnecting in 5s...")
+                # Watchdog loop — checks every 30s if candles are still arriving
+                while True:
+                    time.sleep(30)
+                    elapsed = time.time() - self.last_candle_time
+                    if elapsed > WATCHDOG_TIMEOUT:
+                        log.warning(f"⚠️ No candle in {int(elapsed/60)} min — forcing reconnect...")
+                        break
+                    if not twm.is_alive():
+                        log.warning("⚠️ WebSocket thread died — reconnecting...")
+                        break
 
             except Exception as e:
                 log.error(f"WebSocket error: {e} — reconnecting in 5s...")
@@ -375,6 +385,7 @@ class ProBot:
                 except Exception:
                     pass
 
+            log.info("🔄 Reconnecting in 5s...")
             time.sleep(5)
 
 
