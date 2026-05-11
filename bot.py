@@ -29,7 +29,7 @@ EMA_PERIOD = 198
 ATR_PERIOD = 15
 RSI_PERIOD = 15
 VWAP_PERIOD = 288
-COOLDOWN = 2
+COOLDOWN = 3  # cooldown in number of candles after a trade (3 candles = 15 min)
 
 BASE_URL = "https://fapi.binance.com"
 
@@ -296,11 +296,11 @@ class ProBot:
 
         # Mean reversion — same as paper strategy
         # LONG: price above EMA, slightly below VWAP (within 0.2%), RSI weak
-        if close > ema and close < vwap * 1.002 and rsi < 45:
+        if close > ema and close < vwap * 1.002 and rsi < 42:
             self.place_trade("BUY", close, atr)
 
         # SHORT: price below EMA, slightly above VWAP (within 0.2%), RSI strong
-        elif close < ema and close > vwap * 0.998 and rsi > 55:
+        elif close < ema and close > vwap * 0.998 and rsi > 60:
             self.place_trade("SELL", close, atr)
 
     # =============================
