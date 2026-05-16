@@ -1,3 +1,6 @@
 .env
 test.py
 ProBot_Documentation.docx
+paper.py
+paper_trades.csv 
+paper_bot.log
