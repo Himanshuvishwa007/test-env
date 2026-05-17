@@ -31,8 +31,9 @@ RSI_PERIOD = 15
 VWAP_PERIOD = 288
 COOLDOWN = 3
 
-TP_MULT = 1.8   # take profit = 1.8 x ATR
-SL_MULT = 1.5   # stop loss   = 1.5 x ATR
+TP_MULT = 1.5   # take profit = 1.5 x ATR
+SL_MULT = 1.0   # stop loss   = 1.0 x ATR
+MIN_ATR = 3.0   # skip trade if ATR below this — fees eat profit in slow market
 
 BASE_URL = "https://fapi.binance.com"
 
@@ -301,12 +302,17 @@ class ProBot:
         if None in (ema, atr, rsi, vwap):
             return
 
-        # LONG: price above EMA, within 0.2% below VWAP, RSI weak
-        if close > ema and close < vwap * 1.002 and rsi < 42:
+        # Skip if market too slow — fees not worth it
+        if atr < MIN_ATR:
+            log.info(f"ATR={round(atr,2)} < MIN_ATR={MIN_ATR} — skipping, market too slow")
+            return
+
+        # LONG: price above EMA, within 0.3% below VWAP, RSI weak
+        if close > ema and close < vwap * 1.003 and rsi < 42:
             self.place_trade("BUY", close, atr)
 
-        # SHORT: price below EMA, within 0.2% above VWAP, RSI strong
-        elif close < ema and close > vwap * 0.998 and rsi > 60:
+        # SHORT: price below EMA, within 0.3% above VWAP, RSI strong
+        elif close < ema and close > vwap * 0.997 and rsi > 60:
             self.place_trade("SELL", close, atr)
 
     # =============================
@@ -351,7 +357,7 @@ class ProBot:
         monitor.start()
 
         log.info("BOT STARTED")
-        log.info(f"TP={TP_MULT}x ATR | SL={SL_MULT}x ATR | R:R = 1:{round(TP_MULT/SL_MULT, 2)}")
+        log.info(f"TP={TP_MULT}x ATR | SL={SL_MULT}x ATR | R:R = 1:{round(TP_MULT/SL_MULT, 2)} | MIN_ATR={MIN_ATR} | VWAP band=0.3%")
 
         self.last_candle_time = time.time()
         WATCHDOG_TIMEOUT = 15 * 60
