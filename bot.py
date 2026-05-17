@@ -21,10 +21,11 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_LIVE_API_KEY")
 API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 
-SYMBOL = "ETHUSDT"
+# Add or remove symbols here — each runs independently
+SYMBOLS = ["ETHUSDT", "SOLUSDT"]
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
-LEVERAGE = 3
+LEVERAGE = 3          # applied per symbol
 EMA_PERIOD = 198
 ATR_PERIOD = 15
 RSI_PERIOD = 15
@@ -33,7 +34,11 @@ COOLDOWN = 3
 
 TP_MULT = 1.5   # take profit = 1.5 x ATR
 SL_MULT = 1.0   # stop loss   = 1.0 x ATR
-MIN_ATR = 3.0   # skip trade if ATR below this — fees eat profit in slow market
+# Minimum ATR per symbol — BTC moves more so threshold is higher
+MIN_ATR = {
+    "ETHUSDT": 3.0,
+    "SOLUSDT": 1.5,
+}
 
 BASE_URL = "https://fapi.binance.com"
 
@@ -54,7 +59,8 @@ log.addHandler(file_handler)
 # =============================
 class ProBot:
 
-    def __init__(self):
+    def __init__(self, symbol):
+        self.symbol = symbol
         self.client = Client(API_KEY, API_SECRET)
 
         self.ema = None
@@ -77,7 +83,7 @@ class ProBot:
         # precision
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
-            if s["symbol"] == SYMBOL:
+            if s["symbol"] == self.symbol:
                 for f in s["filters"]:
                     if f["filterType"] == "LOT_SIZE":
                         self.step = float(f["stepSize"])
@@ -99,7 +105,7 @@ class ProBot:
 
     def get_position(self):
         try:
-            pos = self.client.futures_position_information(symbol=SYMBOL)
+            pos = self.client.futures_position_information(symbol=self.symbol)
             for p in pos:
                 amt = float(p["positionAmt"])
                 if amt != 0:
@@ -122,7 +128,7 @@ class ProBot:
 
     def place_algo_order(self, side, order_type, trigger_price, qty):
         params = {
-            "symbol": SYMBOL,
+            "symbol": self.symbol,
             "side": side,
             "type": order_type,
             "algoType": "CONDITIONAL",
@@ -146,7 +152,7 @@ class ProBot:
 
     def cancel_algo_order(self, algo_id):
         try:
-            params = self._sign_request({"symbol": SYMBOL, "algoId": algo_id})
+            params = self._sign_request({"symbol": self.symbol, "algoId": algo_id})
             resp = requests.delete(
                 f"{BASE_URL}/fapi/v1/algoOrder",
                 headers={"X-MBX-APIKEY": API_KEY},
@@ -221,7 +227,7 @@ class ProBot:
     # =============================
     def preload_data(self):
         log.info("Preloading VWAP (288 candles)...")
-        klines = self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=VWAP_PERIOD)
+        klines = self.client.futures_klines(symbol=self.symbol, interval=INTERVAL, limit=VWAP_PERIOD)
         for k in klines:
             self.update_indicators(float(k[4]), float(k[2]), float(k[3]), float(k[5]))
         log.info("Preload complete")
@@ -255,7 +261,7 @@ class ProBot:
 
         try:
             self.client.futures_create_order(
-                symbol=SYMBOL,
+                symbol=self.symbol,
                 side=side,
                 type="MARKET",
                 quantity=qty
@@ -263,7 +269,7 @@ class ProBot:
 
             time.sleep(0.5)
 
-            pos = self.client.futures_position_information(symbol=SYMBOL)
+            pos = self.client.futures_position_information(symbol=self.symbol)
             entry = None
             for p in pos:
                 if float(p["positionAmt"]) != 0:
@@ -303,8 +309,9 @@ class ProBot:
             return
 
         # Skip if market too slow — fees not worth it
-        if atr < MIN_ATR:
-            log.info(f"ATR={round(atr,2)} < MIN_ATR={MIN_ATR} — skipping, market too slow")
+        min_atr = MIN_ATR.get(self.symbol, 3.0)
+        if atr < min_atr:
+            log.info(f"[{self.symbol}] ATR={round(atr,2)} < MIN_ATR={min_atr} — skipping")
             return
 
         # LONG: price above EMA, within 0.3% below VWAP, RSI weak
@@ -333,7 +340,7 @@ class ProBot:
             self.last_candle_time = time.time()
 
             log.info(
-                f"CLOSE={close:.2f} | EMA={round(ema,2) if ema else 'NA'} | "
+                f"[{self.symbol}] CLOSE={close:.2f} | EMA={round(ema,2) if ema else 'NA'} | "
                 f"RSI={round(rsi,2) if rsi else 'NA'} | "
                 f"VWAP={round(vwap,2) if vwap else 'NA'} | "
                 f"ATR={round(atr,2) if atr else 'NA'} | "
@@ -350,14 +357,13 @@ class ProBot:
 
     # =============================
     def run(self):
-        self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        self.client.futures_change_leverage(symbol=self.symbol, leverage=LEVERAGE)
         self.preload_data()
 
         monitor = threading.Thread(target=self.position_monitor, daemon=True)
         monitor.start()
 
-        log.info("BOT STARTED")
-        log.info(f"TP={TP_MULT}x ATR | SL={SL_MULT}x ATR | R:R = 1:{round(TP_MULT/SL_MULT, 2)} | MIN_ATR={MIN_ATR} | VWAP band=0.3%")
+        log.info(f"[{self.symbol}] BOT STARTED | TP={TP_MULT}x | SL={SL_MULT}x | MIN_ATR={MIN_ATR.get(self.symbol,3.0)} | VWAP band=0.3%")
 
         self.last_candle_time = time.time()
         WATCHDOG_TIMEOUT = 15 * 60
@@ -369,10 +375,10 @@ class ProBot:
                 twm.start()
                 twm.start_kline_socket(
                     callback=self.on_message,
-                    symbol=SYMBOL,
+                    symbol=self.symbol,
                     interval=INTERVAL
                 )
-                log.info("WebSocket connected")
+                log.info(f"[{self.symbol}] WebSocket connected")
 
                 while True:
                     time.sleep(30)
@@ -399,4 +405,14 @@ class ProBot:
 
 
 if __name__ == "__main__":
-    ProBot().run()
+    log.info(f"Starting bots for: {SYMBOLS}")
+    threads = []
+    for sym in SYMBOLS:
+        bot = ProBot(sym)
+        t = threading.Thread(target=bot.run, name=f"bot-{sym}", daemon=False)
+        t.start()
+        threads.append(t)
+        time.sleep(2)  # stagger startup to avoid API rate limits
+
+    for t in threads:
+        t.join()
