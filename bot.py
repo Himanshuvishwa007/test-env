@@ -29,7 +29,10 @@ EMA_PERIOD = 198
 ATR_PERIOD = 15
 RSI_PERIOD = 15
 VWAP_PERIOD = 288
-COOLDOWN = 3  # cooldown in number of candles after a trade (3 candles = 15 min)
+COOLDOWN = 3
+
+TP_MULT = 1.8   # take profit = 1.8 x ATR
+SL_MULT = 1.5   # stop loss   = 1.5 x ATR
 
 BASE_URL = "https://fapi.binance.com"
 
@@ -164,13 +167,13 @@ class ProBot:
 
     # =============================
     def position_monitor(self):
-        log.info("🔍 Position monitor started")
+        log.info("Position monitor started")
         while True:
             try:
                 amt = self.get_position()
                 with self._trade_lock:
                     if self.in_trade and amt == 0:
-                        log.info("✅ Position closed — cancelling orphan algo orders")
+                        log.info("Position closed — cancelling orphan algo orders")
                         self.cancel_all_algo_orders()
                         self.in_trade = False
             except Exception as e:
@@ -216,11 +219,11 @@ class ProBot:
 
     # =============================
     def preload_data(self):
-        log.info("📊 Preloading VWAP (288 candles)...")
+        log.info("Preloading VWAP (288 candles)...")
         klines = self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=VWAP_PERIOD)
         for k in klines:
             self.update_indicators(float(k[4]), float(k[2]), float(k[3]), float(k[5]))
-        log.info("✅ Preload complete")
+        log.info("Preload complete")
 
     # =============================
     def place_trade(self, side, price, atr):
@@ -270,10 +273,14 @@ class ProBot:
                 log.error("Could not fetch entry price — aborting SL/TP")
                 return
 
-            sl = self.round_price(entry - atr if side == "BUY" else entry + atr)
-            tp = self.round_price(entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5)
+            # ATR-based SL and TP using config multipliers
+            sl = self.round_price(entry - atr * SL_MULT if side == "BUY" else entry + atr * SL_MULT)
+            tp = self.round_price(entry + atr * TP_MULT if side == "BUY" else entry - atr * TP_MULT)
 
-            log.info(f"{side} | Entry={entry:.2f} | TP={tp:.2f} | SL={sl:.2f} | Qty={qty}")
+            log.info(
+                f"{side} | Entry={entry:.2f} | TP={tp:.2f} (ATR x{TP_MULT}) | "
+                f"SL={sl:.2f} (ATR x{SL_MULT}) | ATR={round(atr,2)} | Qty={qty}"
+            )
 
             self.sl_algo_id = self.place_algo_order(close_side, "STOP_MARKET", sl, qty)
             log.info(f"SL algo order placed: ID={self.sl_algo_id}")
@@ -294,13 +301,12 @@ class ProBot:
         if None in (ema, atr, rsi, vwap):
             return
 
-        # Mean reversion — same as paper strategy
-        # LONG: price above EMA, slightly below VWAP (within 0.3%), RSI weak
-        if close > ema and close < vwap * 1.003 and rsi < 42:
+        # LONG: price above EMA, within 0.2% below VWAP, RSI weak
+        if close > ema and close < vwap * 1.002 and rsi < 42:
             self.place_trade("BUY", close, atr)
 
-        # SHORT: price below EMA, slightly above VWAP (within 0.3%), RSI strong
-        elif close < ema and close > vwap * 0.997 and rsi > 60:
+        # SHORT: price below EMA, within 0.2% above VWAP, RSI strong
+        elif close < ema and close > vwap * 0.998 and rsi > 60:
             self.place_trade("SELL", close, atr)
 
     # =============================
@@ -318,7 +324,7 @@ class ProBot:
             volume = float(k["v"])
 
             ema, atr, rsi, vwap = self.update_indicators(close, high, low, volume)
-            self.last_candle_time = time.time()  # watchdog heartbeat
+            self.last_candle_time = time.time()
 
             log.info(
                 f"CLOSE={close:.2f} | EMA={round(ema,2) if ema else 'NA'} | "
@@ -341,14 +347,12 @@ class ProBot:
         self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
         self.preload_data()
 
-        # Start position monitor in background
         monitor = threading.Thread(target=self.position_monitor, daemon=True)
         monitor.start()
 
-        log.info("🚀 BOT STARTED")
+        log.info("BOT STARTED")
+        log.info(f"TP={TP_MULT}x ATR | SL={SL_MULT}x ATR | R:R = 1:{round(TP_MULT/SL_MULT, 2)}")
 
-        # Watchdog: if no candle received in 15 min — force reconnect
-        # 5-min candles should arrive every 5 min; 15 min = 3 missed candles
         self.last_candle_time = time.time()
         WATCHDOG_TIMEOUT = 15 * 60
 
@@ -362,17 +366,16 @@ class ProBot:
                     symbol=SYMBOL,
                     interval=INTERVAL
                 )
-                log.info("🔌 WebSocket connected")
+                log.info("WebSocket connected")
 
-                # Watchdog loop — checks every 30s if candles are still arriving
                 while True:
                     time.sleep(30)
                     elapsed = time.time() - self.last_candle_time
                     if elapsed > WATCHDOG_TIMEOUT:
-                        log.warning(f"⚠️ No candle in {int(elapsed/60)} min — forcing reconnect...")
+                        log.warning(f"No candle in {int(elapsed/60)} min — reconnecting...")
                         break
                     if not twm.is_alive():
-                        log.warning("⚠️ WebSocket thread died — reconnecting...")
+                        log.warning("WebSocket thread died — reconnecting...")
                         break
 
             except Exception as e:
@@ -385,7 +388,7 @@ class ProBot:
                 except Exception:
                     pass
 
-            log.info("🔄 Reconnecting in 5s...")
+            log.info("Reconnecting in 5s...")
             time.sleep(5)
 
 
