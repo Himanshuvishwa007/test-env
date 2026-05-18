@@ -27,14 +27,12 @@ INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 3
 EMA_PERIOD = 198
-ATR_PERIOD = 15
 RSI_PERIOD = 15
 VWAP_PERIOD = 288
 COOLDOWN = 3
 
-TP_PCT = 0.008   # 0.8% take profit from entry
-SL_PCT = 0.005   # 0.5% stop loss from entry
-
+TP_PCT    = 0.008   # 0.8% take profit from entry
+SL_PCT    = 0.005   # 0.5% stop loss from entry
 VWAP_BAND = 0.002   # 0.2% proximity to VWAP required
 
 BASE_URL = "https://fapi.binance.com"
@@ -62,8 +60,6 @@ class ProBot:
 
         self.ema = None
         self.prev_close = None
-        self.atr = None
-        self.tr_queue = deque(maxlen=ATR_PERIOD)
         self.rsi_queue = deque(maxlen=RSI_PERIOD)
         self.vwap_queue = deque(maxlen=VWAP_PERIOD)
         self.vwap_pv_sum = 0
@@ -185,21 +181,16 @@ class ProBot:
             time.sleep(3)
 
     # =============================
-    def update_indicators(self, close, high, low, volume):
-
+    def update_indicators(self, close, volume):
         if self.ema is None:
             self.ema = close
             self.prev_close = close
             return None, None, None
 
+        # EMA
         self.ema += self.alpha * (close - self.ema)
 
-        # ATR still calculated for logging only — not used for SL/TP
-        tr = max(high - low, abs(high - self.prev_close), abs(low - self.prev_close))
-        self.tr_queue.append(tr)
-        if len(self.tr_queue) == ATR_PERIOD:
-            self.atr = sum(self.tr_queue) / ATR_PERIOD
-
+        # RSI
         change = close - self.prev_close
         self.rsi_queue.append(change)
         if len(self.rsi_queue) == RSI_PERIOD:
@@ -209,6 +200,7 @@ class ProBot:
         else:
             rsi = None
 
+        # Rolling VWAP
         pv = close * volume
         if len(self.vwap_queue) == self.vwap_queue.maxlen:
             old_pv, old_vol = self.vwap_queue[0]
@@ -227,7 +219,7 @@ class ProBot:
         log.info(f"[{self.symbol}] Preloading VWAP (288 candles)...")
         klines = self.client.futures_klines(symbol=self.symbol, interval=INTERVAL, limit=VWAP_PERIOD)
         for k in klines:
-            self.update_indicators(float(k[4]), float(k[2]), float(k[3]), float(k[5]))
+            self.update_indicators(float(k[4]), float(k[5]))
         log.info(f"[{self.symbol}] Preload complete")
 
     # =============================
@@ -275,7 +267,7 @@ class ProBot:
                 log.error(f"[{self.symbol}] Could not fetch entry price — aborting SL/TP")
                 return
 
-            # Percentage-based SL and TP from actual entry price
+            # Percentage-based SL and TP
             if side == "BUY":
                 sl = self.round_price(entry * (1 - SL_PCT))
                 tp = self.round_price(entry * (1 + TP_PCT))
@@ -325,12 +317,10 @@ class ProBot:
             if not k["x"]:
                 return
 
-            close = float(k["c"])
-            high = float(k["h"])
-            low = float(k["l"])
+            close  = float(k["c"])
             volume = float(k["v"])
 
-            result = self.update_indicators(close, high, low, volume)
+            result = self.update_indicators(close, volume)
             self.last_candle_time = time.time()
 
             if result == (None, None, None):
@@ -339,10 +329,10 @@ class ProBot:
             ema, rsi, vwap = result
 
             log.info(
-                f"[{self.symbol}] CLOSE={close:.4f} | EMA={round(ema,4) if ema else 'NA'} | "
+                f"[{self.symbol}] CLOSE={close:.4f} | "
+                f"EMA={round(ema,4) if ema else 'NA'} | "
                 f"RSI={round(rsi,2) if rsi else 'NA'} | "
                 f"VWAP={round(vwap,4) if vwap else 'NA'} | "
-                f"ATR={round(self.atr,4) if self.atr else 'NA'} | "
                 f"IN_TRADE={self.in_trade}"
             )
 
