@@ -25,20 +25,17 @@ API_SECRET = os.getenv("BINANCE_LIVE_API_SECRET")
 SYMBOLS = ["ETHUSDT", "SOLUSDT"]
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
-LEVERAGE = 3          # applied per symbol
+LEVERAGE = 3
 EMA_PERIOD = 198
 ATR_PERIOD = 15
 RSI_PERIOD = 15
 VWAP_PERIOD = 288
 COOLDOWN = 3
 
-TP_MULT = 1.5   # take profit = 1.5 x ATR
-SL_MULT = 1.0   # stop loss   = 1.0 x ATR
-# Minimum ATR per symbol — BTC moves more so threshold is higher
-MIN_ATR = {
-    "ETHUSDT": 3.0,
-    "SOLUSDT": 1.5,
-}
+TP_PCT = 0.008   # 0.8% take profit from entry
+SL_PCT = 0.005   # 0.5% stop loss from entry
+
+VWAP_BAND = 0.002   # 0.2% proximity to VWAP required
 
 BASE_URL = "https://fapi.binance.com"
 
@@ -174,17 +171,17 @@ class ProBot:
 
     # =============================
     def position_monitor(self):
-        log.info("Position monitor started")
+        log.info(f"[{self.symbol}] Position monitor started")
         while True:
             try:
                 amt = self.get_position()
                 with self._trade_lock:
                     if self.in_trade and amt == 0:
-                        log.info("Position closed — cancelling orphan algo orders")
+                        log.info(f"[{self.symbol}] Position closed — cancelling orphan algo orders")
                         self.cancel_all_algo_orders()
                         self.in_trade = False
             except Exception as e:
-                log.warning(f"Monitor error: {e}")
+                log.warning(f"[{self.symbol}] Monitor error: {e}")
             time.sleep(3)
 
     # =============================
@@ -193,10 +190,11 @@ class ProBot:
         if self.ema is None:
             self.ema = close
             self.prev_close = close
-            return None, None, None, None
+            return None, None, None
 
         self.ema += self.alpha * (close - self.ema)
 
+        # ATR still calculated for logging only — not used for SL/TP
         tr = max(high - low, abs(high - self.prev_close), abs(low - self.prev_close))
         self.tr_queue.append(tr)
         if len(self.tr_queue) == ATR_PERIOD:
@@ -222,27 +220,24 @@ class ProBot:
         vwap = self.vwap_pv_sum / self.vwap_vol_sum if self.vwap_vol_sum > 0 else None
 
         self.prev_close = close
-        return self.ema, self.atr, rsi, vwap
+        return self.ema, rsi, vwap
 
     # =============================
     def preload_data(self):
-        log.info("Preloading VWAP (288 candles)...")
+        log.info(f"[{self.symbol}] Preloading VWAP (288 candles)...")
         klines = self.client.futures_klines(symbol=self.symbol, interval=INTERVAL, limit=VWAP_PERIOD)
         for k in klines:
             self.update_indicators(float(k[4]), float(k[2]), float(k[3]), float(k[5]))
-        log.info("Preload complete")
+        log.info(f"[{self.symbol}] Preload complete")
 
     # =============================
-    def place_trade(self, side, price, atr):
+    def place_trade(self, side, price):
 
         with self._trade_lock:
             if self.in_trade:
                 return
             if self.cooldown > 0:
                 return
-
-        if atr is None or atr <= 0:
-            return
 
         if self.get_position() != 0:
             with self._trade_lock:
@@ -277,50 +272,49 @@ class ProBot:
                     break
 
             if not entry or entry == 0:
-                log.error("Could not fetch entry price — aborting SL/TP")
+                log.error(f"[{self.symbol}] Could not fetch entry price — aborting SL/TP")
                 return
 
-            # ATR-based SL and TP using config multipliers
-            sl = self.round_price(entry - atr * SL_MULT if side == "BUY" else entry + atr * SL_MULT)
-            tp = self.round_price(entry + atr * TP_MULT if side == "BUY" else entry - atr * TP_MULT)
+            # Percentage-based SL and TP from actual entry price
+            if side == "BUY":
+                sl = self.round_price(entry * (1 - SL_PCT))
+                tp = self.round_price(entry * (1 + TP_PCT))
+            else:
+                sl = self.round_price(entry * (1 + SL_PCT))
+                tp = self.round_price(entry * (1 - TP_PCT))
 
             log.info(
-                f"{side} | Entry={entry:.2f} | TP={tp:.2f} (ATR x{TP_MULT}) | "
-                f"SL={sl:.2f} (ATR x{SL_MULT}) | ATR={round(atr,2)} | Qty={qty}"
+                f"[{self.symbol}] {side} | Entry={entry:.4f} | "
+                f"TP={tp:.4f} (+{TP_PCT*100}%) | "
+                f"SL={sl:.4f} (-{SL_PCT*100}%) | Qty={qty}"
             )
 
             self.sl_algo_id = self.place_algo_order(close_side, "STOP_MARKET", sl, qty)
-            log.info(f"SL algo order placed: ID={self.sl_algo_id}")
+            log.info(f"[{self.symbol}] SL algo order placed: ID={self.sl_algo_id}")
 
             self.tp_algo_id = self.place_algo_order(close_side, "TAKE_PROFIT_MARKET", tp, qty)
-            log.info(f"TP algo order placed: ID={self.tp_algo_id}")
+            log.info(f"[{self.symbol}] TP algo order placed: ID={self.tp_algo_id}")
 
             with self._trade_lock:
                 self.in_trade = True
                 self.cooldown = COOLDOWN
 
         except Exception as e:
-            log.error(f"TRADE ERROR: {e}")
+            log.error(f"[{self.symbol}] TRADE ERROR: {e}")
             self.cancel_all_algo_orders()
 
     # =============================
-    def strategy(self, close, ema, atr, rsi, vwap):
-        if None in (ema, atr, rsi, vwap):
+    def strategy(self, close, ema, rsi, vwap):
+        if None in (ema, rsi, vwap):
             return
 
-        # Skip if market too slow — fees not worth it
-        min_atr = MIN_ATR.get(self.symbol, 3.0)
-        if atr < min_atr:
-            log.info(f"[{self.symbol}] ATR={round(atr,2)} < MIN_ATR={min_atr} — skipping")
-            return
+        # LONG: price above EMA, within 0.2% below VWAP, RSI weak
+        if close > ema and close < vwap * (1 + VWAP_BAND) and rsi < 42:
+            self.place_trade("BUY", close)
 
-        # LONG: price above EMA, within 0.3% below VWAP, RSI weak
-        if close > ema and close < vwap * 1.003 and rsi < 42:
-            self.place_trade("BUY", close, atr)
-
-        # SHORT: price below EMA, within 0.3% above VWAP, RSI strong
-        elif close < ema and close > vwap * 0.997 and rsi > 60:
-            self.place_trade("SELL", close, atr)
+        # SHORT: price below EMA, within 0.2% above VWAP, RSI strong
+        elif close < ema and close > vwap * (1 - VWAP_BAND) and rsi > 60:
+            self.place_trade("SELL", close)
 
     # =============================
     def on_message(self, msg):
@@ -336,24 +330,29 @@ class ProBot:
             low = float(k["l"])
             volume = float(k["v"])
 
-            ema, atr, rsi, vwap = self.update_indicators(close, high, low, volume)
+            result = self.update_indicators(close, high, low, volume)
             self.last_candle_time = time.time()
 
+            if result == (None, None, None):
+                return
+
+            ema, rsi, vwap = result
+
             log.info(
-                f"[{self.symbol}] CLOSE={close:.2f} | EMA={round(ema,2) if ema else 'NA'} | "
+                f"[{self.symbol}] CLOSE={close:.4f} | EMA={round(ema,4) if ema else 'NA'} | "
                 f"RSI={round(rsi,2) if rsi else 'NA'} | "
-                f"VWAP={round(vwap,2) if vwap else 'NA'} | "
-                f"ATR={round(atr,2) if atr else 'NA'} | "
+                f"VWAP={round(vwap,4) if vwap else 'NA'} | "
+                f"ATR={round(self.atr,4) if self.atr else 'NA'} | "
                 f"IN_TRADE={self.in_trade}"
             )
 
-            self.strategy(close, ema, atr, rsi, vwap)
+            self.strategy(close, ema, rsi, vwap)
 
             if self.cooldown > 0:
                 self.cooldown -= 1
 
         except Exception as e:
-            log.error(f"WS ERROR: {e}")
+            log.error(f"[{self.symbol}] WS ERROR: {e}")
 
     # =============================
     def run(self):
@@ -363,7 +362,11 @@ class ProBot:
         monitor = threading.Thread(target=self.position_monitor, daemon=True)
         monitor.start()
 
-        log.info(f"[{self.symbol}] BOT STARTED | TP={TP_MULT}x | SL={SL_MULT}x | MIN_ATR={MIN_ATR.get(self.symbol,3.0)} | VWAP band=0.3%")
+        log.info(
+            f"[{self.symbol}] BOT STARTED | "
+            f"TP={TP_PCT*100}% | SL={SL_PCT*100}% | "
+            f"R:R=1:{round(TP_PCT/SL_PCT,2)} | VWAP band={VWAP_BAND*100}%"
+        )
 
         self.last_candle_time = time.time()
         WATCHDOG_TIMEOUT = 15 * 60
@@ -384,14 +387,14 @@ class ProBot:
                     time.sleep(30)
                     elapsed = time.time() - self.last_candle_time
                     if elapsed > WATCHDOG_TIMEOUT:
-                        log.warning(f"No candle in {int(elapsed/60)} min — reconnecting...")
+                        log.warning(f"[{self.symbol}] No candle in {int(elapsed/60)} min — reconnecting...")
                         break
                     if not twm.is_alive():
-                        log.warning("WebSocket thread died — reconnecting...")
+                        log.warning(f"[{self.symbol}] WebSocket thread died — reconnecting...")
                         break
 
             except Exception as e:
-                log.error(f"WebSocket error: {e} — reconnecting in 5s...")
+                log.error(f"[{self.symbol}] WebSocket error: {e} — reconnecting in 5s...")
 
             finally:
                 try:
@@ -400,7 +403,7 @@ class ProBot:
                 except Exception:
                     pass
 
-            log.info("Reconnecting in 5s...")
+            log.info(f"[{self.symbol}] Reconnecting in 5s...")
             time.sleep(5)
 
 
@@ -412,7 +415,7 @@ if __name__ == "__main__":
         t = threading.Thread(target=bot.run, name=f"bot-{sym}", daemon=False)
         t.start()
         threads.append(t)
-        time.sleep(2)  # stagger startup to avoid API rate limits
+        time.sleep(2)
 
     for t in threads:
         t.join()
