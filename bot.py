@@ -37,7 +37,7 @@ SL_MULT = 1.0   # stop loss   = 1.0 x ATR
 # Minimum ATR per symbol — BTC moves more so threshold is higher
 MIN_ATR = {
     "ETHUSDT": 2.0,
-    "SOLUSDT": 1.0,
+    "SOLUSDT": 0.9,
 }
 
 BASE_URL = "https://fapi.binance.com"
