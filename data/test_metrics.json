@@ -1,0 +1,18 @@
+{
+  "total_candles": 1121,
+  "total_signals_buy": 24,
+  "total_signals_sell": 90,
+  "total_trades": 11,
+  "winning_trades": 6,
+  "losing_trades": 5,
+  "win_rate_pct": 54.55,
+  "gross_profit_usdt": 300.79249999999996,
+  "gross_loss_usdt": 143.2514,
+  "total_fees_usdt": 24.7592,
+  "net_pnl_usdt": 132.7818,
+  "profit_factor": 2.1,
+  "initial_balance": 1000.0,
+  "current_balance": 1132.78,
+  "return_on_capital_pct": 13.28,
+  "updated_at": "2026-10-15T10:09:31.551193"
+}
