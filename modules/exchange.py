@@ -31,24 +31,40 @@ class BinanceExchange:
         api_key: str,
         api_secret: str,
         base_url: str = "https://fapi.binance.com",
-        testnet: bool = False
+        testnet: bool = False,
+        proxy: Optional[str] = None
     ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url.rstrip("/")
         self.testnet = testnet
+        self.proxy = proxy
 
         # Initialize python-binance Client
-        self.client = Client(
-            api_key=self.api_key,
-            api_secret=self.api_secret,
-            testnet=self.testnet
-        )
+        client_kwargs = {
+            "api_key": self.api_key,
+            "api_secret": self.api_secret,
+            "testnet": self.testnet
+        }
+        if self.proxy:
+            client_kwargs["requests_params"] = {
+                "proxies": {
+                    "http": self.proxy,
+                    "https": self.proxy
+                }
+            }
+
+        self.client = Client(**client_kwargs)
         if self.testnet:
             self.client.FUTURES_URL = f"{self.base_url}/fapi"
 
         # Shared HTTP session for custom REST requests (algoOrder)
         self.session = requests.Session()
+        if self.proxy:
+            self.session.proxies = {
+                "http": self.proxy,
+                "https": self.proxy
+            }
         retry_strategy = Retry(
             total=3,
             backoff_factor=0.5,

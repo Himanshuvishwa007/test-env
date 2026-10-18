@@ -105,7 +105,8 @@ def main() -> None:
         api_key=config.api_key,
         api_secret=config.api_secret,
         base_url=config.base_url,
-        testnet=is_testnet
+        testnet=is_testnet,
+        proxy=config.proxy
     )
 
     # Check connection and balance

@@ -65,12 +65,16 @@ class BotConfig:
     api_secret: str = ""
     base_url: str = "https://fapi.binance.com"
     ws_base_url: str = "wss://fstream.binance.com/ws"
+    proxy: Optional[str] = None
 
     def __post_init__(self):
         # Determine trading mode from env if not explicitly passed
         env_mode = os.getenv("TRADING_MODE", "live").strip().lower()
         if not self.trading_mode or self.trading_mode == "live":
             self.trading_mode = env_mode
+
+        # Proxy support (e.g. http://ip:port or socks5://ip:port)
+        self.proxy = self.proxy or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("BINANCE_PROXY")
 
         # Set endpoints and API keys based on mode
         if self.trading_mode == "testnet":

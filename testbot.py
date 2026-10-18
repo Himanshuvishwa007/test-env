@@ -559,7 +559,8 @@ def main():
             api_key=config.api_key,
             api_secret=config.api_secret,
             base_url=config.base_url,
-            testnet=True
+            testnet=True,
+            proxy=config.proxy
         )
         try:
             bal = test_exchange.get_balance()
