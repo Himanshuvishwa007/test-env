@@ -271,13 +271,32 @@ class ProBot:
         stream_name = f"{self.symbol.lower()}@kline_{self.config.interval}"
         ws_url = f"{self.config.ws_base_url}/{stream_name}"
 
+        consecutive_ws_failures = 0
+        max_ws_failures = 3
+
         while not self.stop_event.is_set():
+            # If WebSocket fails repeatedly (e.g. on restricted EC2 instances or proxies without WS upgrade),
+            # gracefully fall back to REST Polling Mode so trading continues 100% uninterrupted
+            if consecutive_ws_failures >= max_ws_failures:
+                log.warning(
+                    f"[{self.symbol}] WebSocket disconnected {consecutive_ws_failures} times in a row. "
+                    f"Switching to resilient REST Polling Mode (evaluating candles every 5s)..."
+                )
+                self.run_rest_polling(fallback_duration_sec=300)
+                # After 5 minutes of steady REST polling, attempt WebSocket again
+                consecutive_ws_failures = 0
+                continue
+
             self._ws = None
             wst = None
             ws_closed_event = threading.Event()
+            connect_start_time = time.time()
+            received_any_message = False
 
             try:
                 def _on_message(_ws, message):
+                    nonlocal received_any_message
+                    received_any_message = True
                     self.on_ws_message(message)
 
                 def _on_error(_ws, error):
@@ -345,11 +364,58 @@ class ProBot:
                 if wst and wst.is_alive():
                     wst.join(timeout=2.0)
 
+            # Check if this connection was dropped prematurely (< 10 seconds without messages)
+            session_duration = time.time() - connect_start_time
+            if not received_any_message and session_duration < 10.0:
+                consecutive_ws_failures += 1
+            else:
+                consecutive_ws_failures = 0
+
             if not self.stop_event.is_set():
                 log.info(f"[{self.symbol}] Reconnecting WebSocket in 3 seconds...")
                 self.stop_event.wait(3.0)
 
         log.info(f"[{self.symbol}] Bot run loop terminated")
+
+    def run_rest_polling(self, fallback_duration_sec: int = 300) -> None:
+        """
+        Resilient REST Polling Fallback.
+        Polls Binance REST API for candles when WebSocket is blocked by firewalls or cloud providers.
+        Ensures 100% uninterrupted trade execution.
+        """
+        start_time = time.time()
+        last_processed_ts = 0
+        log.info(f"[{self.symbol}] REST Polling Fallback active (checking every 5 seconds)...")
+
+        while not self.stop_event.is_set():
+            if time.time() - start_time >= fallback_duration_sec:
+                log.info(f"[{self.symbol}] REST Polling fallback period elapsed. Retrying WebSocket stream...")
+                break
+
+            try:
+                klines = self.exchange.fetch_klines(
+                    symbol=self.symbol,
+                    interval=self.config.interval,
+                    limit=3
+                )
+                if klines and len(klines) >= 2:
+                    # klines[-2] is the most recently closed candle
+                    closed_k = klines[-2]
+                    candle_ts = int(closed_k[0])
+
+                    if candle_ts > last_processed_ts:
+                        last_processed_ts = candle_ts
+                        open_p = float(closed_k[1])
+                        high = float(closed_k[2])
+                        low = float(closed_k[3])
+                        close = float(closed_k[4])
+                        vol = float(closed_k[5])
+                        self.on_kline(open_p=open_p, high=high, low=low, close=close, volume=vol)
+
+            except Exception as e:
+                log.warning(f"[{self.symbol}] REST Polling error: {e}")
+
+            self.stop_event.wait(5.0)
 
     def stop(self) -> None:
         """Signals graceful shutdown."""
