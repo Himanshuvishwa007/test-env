@@ -76,22 +76,73 @@ class ProBot:
         """
         Background daemon thread.
         Polls position status and cancels orphan TP/SL orders when a trade closes.
+        Also attaches TP/SL to pre-existing open positions on startup.
         """
         log.info(f"[{self.symbol}] Position monitor started")
         while not self.stop_event.is_set():
             try:
                 amt = self.exchange.get_position(self.symbol)
-                with self._trade_lock:
-                    if self.in_trade and amt == 0:
-                        log.info(f"[{self.symbol}] Position closed — cancelling orphan algo orders")
-                        self.cancel_all_algo_orders()
-                        self.in_trade = False
+                if amt is not None:
+                    with self._trade_lock:
+                        if self.in_trade and amt == 0.0:
+                            log.info(f"[{self.symbol}] Position closed (flat) — cancelling all open/orphan orders")
+                            self.cancel_all_algo_orders()
+                            self.in_trade = False
+                        elif not self.in_trade and amt != 0.0:
+                            # Existing position detected on startup or manual trade
+                            self.in_trade = True
+                            if not self.sl_algo_id and not self.tp_algo_id:
+                                self.protect_existing_position(amt)
             except Exception as e:
                 log.warning(f"[{self.symbol}] Monitor check error: {e}")
 
             self.stop_event.wait(self.config.position_poll_interval)
 
         log.info(f"[{self.symbol}] Position monitor stopped")
+
+    def protect_existing_position(self, amt: float) -> None:
+        """Protects an existing open position with TP and SL if none exist."""
+        try:
+            entry = self.exchange.get_position_entry(self.symbol)
+            if not entry or entry == 0:
+                return
+
+            side = "BUY" if amt > 0 else "SELL"
+            close_side = "SELL" if side == "BUY" else "BUY"
+            qty = abs(amt)
+
+            targets: TradeTargets = self.strategy.calculate_targets(
+                side=side,
+                entry_price=entry,
+                tick_size=self.tick
+            )
+
+            log.info(
+                f"[{self.symbol}] Protecting open {side} position | Entry={entry:.2f} | "
+                f"TP={targets.take_profit:.2f} (+{targets.tp_pct*100:.2f}%) | "
+                f"SL={targets.stop_loss:.2f} (-{targets.sl_pct*100:.2f}%) | Qty={qty}"
+            )
+
+            self.sl_algo_id = self.exchange.place_algo_order(
+                symbol=self.symbol,
+                side=close_side,
+                order_type="STOP_MARKET",
+                trigger_price=targets.stop_loss,
+                qty=qty
+            )
+            log.info(f"[{self.symbol}] Attached SL order: ID={self.sl_algo_id}")
+
+            self.tp_algo_id = self.exchange.place_algo_order(
+                symbol=self.symbol,
+                side=close_side,
+                order_type="TAKE_PROFIT_MARKET",
+                trigger_price=targets.take_profit,
+                qty=qty
+            )
+            log.info(f"[{self.symbol}] Attached TP order: ID={self.tp_algo_id}")
+
+        except Exception as e:
+            log.warning(f"[{self.symbol}] Could not attach TP/SL to open position: {e}")
 
     def preload_data(self) -> None:
         """Preloads historical klines to initialize indicator buffers."""
@@ -268,6 +319,11 @@ class ProBot:
             f"TP={self.config.tp_pct_min*100:.1f}% (1.8:1 R:R)"
         )
 
+        if self.config.data_feed == "rest":
+            log.info(f"[{self.symbol}] Data Feed Mode: REST Polling (evaluating candles every 5s, zero WebSocket disconnects)")
+            self.run_rest_polling(fallback_duration_sec=999999999)
+            return
+
         stream_name = f"{self.symbol.lower()}@kline_{self.config.interval}"
         ws_url = f"{self.config.ws_base_url}/{stream_name}"
 
@@ -282,8 +338,7 @@ class ProBot:
                     f"[{self.symbol}] WebSocket disconnected {consecutive_ws_failures} times in a row. "
                     f"Switching to resilient REST Polling Mode (evaluating candles every 5s)..."
                 )
-                self.run_rest_polling(fallback_duration_sec=300)
-                # After 5 minutes of steady REST polling, attempt WebSocket again
+                self.run_rest_polling(fallback_duration_sec=3600)
                 consecutive_ws_failures = 0
                 continue
 

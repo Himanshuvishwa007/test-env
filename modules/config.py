@@ -61,6 +61,7 @@ class BotConfig:
 
     # Binance API & Endpoints
     trading_mode: str = "live"
+    data_feed: str = "auto"              # Market data feed: 'auto' (WS with REST fallback), 'ws', or 'rest' (pure REST)
     api_key: str = ""
     api_secret: str = ""
     base_url: str = "https://fapi.binance.com"
@@ -72,6 +73,9 @@ class BotConfig:
         env_mode = os.getenv("TRADING_MODE", "live").strip().lower()
         if not self.trading_mode or self.trading_mode == "live":
             self.trading_mode = env_mode
+
+        # Data feed mode ('auto', 'ws', 'rest')
+        self.data_feed = (os.getenv("DATA_FEED") or self.data_feed).strip().lower()
 
         # Proxy support (e.g. http://ip:port or socks5://ip:port)
         self.proxy = self.proxy or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("BINANCE_PROXY")

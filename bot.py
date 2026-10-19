@@ -56,6 +56,12 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="Account leverage multiplier (e.g. --leverage 3)"
     )
+    parser.add_argument(
+        "--feed",
+        choices=["auto", "ws", "rest"],
+        default=None,
+        help="Data feed: 'auto' (WS with REST fallback), 'ws' (WebSocket), or 'rest' (pure REST polling)"
+    )
     return parser.parse_args()
 
 
@@ -88,6 +94,8 @@ def main() -> None:
         config.trading_mode = args.mode
     if args.leverage:
         config.leverage = args.leverage
+    if args.feed:
+        config.data_feed = args.feed
 
     # Validate API credentials
     if not config.api_key or not config.api_secret:

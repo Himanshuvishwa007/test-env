@@ -140,10 +140,10 @@ class BinanceExchange:
             log.error(f"Failed to fetch account balance: {e}")
             return 0.0
 
-    def get_position(self, symbol: str) -> float:
+    def get_position(self, symbol: str) -> Optional[float]:
         """
         Returns active position amount for the symbol.
-        Positive = Long, Negative = Short, 0.0 = Flat.
+        Positive = Long, Negative = Short, 0.0 = Flat, None = API/Network Error.
         """
         try:
             positions = self.client.futures_position_information(symbol=symbol)
@@ -151,9 +151,10 @@ class BinanceExchange:
                 amt = float(p.get("positionAmt", 0.0))
                 if amt != 0:
                     return amt
+            return 0.0
         except Exception as e:
             log.warning(f"[{symbol}] get_position error: {e}")
-        return 0.0
+            return None
 
     def get_position_entry(self, symbol: str) -> Optional[float]:
         """Returns average entry price for the active position, or None if flat."""
@@ -247,8 +248,33 @@ class BinanceExchange:
             log.warning(f"[{symbol}] Cancel algo order {algo_id} error: {e}")
             return None
 
-    def cancel_all_algo_orders(self, symbol: str, algo_ids: List[Optional[str]]) -> None:
-        """Cancels multiple algo orders safely."""
-        for algo_id in algo_ids:
-            if algo_id:
-                self.cancel_algo_order(symbol, algo_id)
+    def cancel_all_algo_orders(self, symbol: str, algo_ids: Optional[List[Optional[str]]] = None) -> None:
+        """
+        Cancels all open algo and regular orders for the symbol.
+        Wipes out any remaining TP or SL orders when a trade closes.
+        """
+        # 1. Cancel known specific algo order IDs
+        if algo_ids:
+            for algo_id in algo_ids:
+                if algo_id:
+                    self.cancel_algo_order(symbol, algo_id)
+
+        # 2. Bulk cancel all open conditional algo orders (/fapi/v1/algoOpenOrders)
+        try:
+            params = {"symbol": symbol}
+            signed_params = self._sign_request(params)
+            url = f"{self.base_url}/fapi/v1/algoOpenOrders"
+            headers = {"X-MBX-APIKEY": self.api_key}
+            resp = self.session.delete(url, headers=headers, params=signed_params, timeout=10)
+            log.info(f"[{symbol}] Bulk cancelled open algo orders: {resp.status_code}")
+        except Exception as e:
+            log.debug(f"[{symbol}] Bulk cancel algo orders notice: {e}")
+
+        # 3. Bulk cancel any standard open orders on this symbol
+        try:
+            self.client.futures_cancel_all_open_orders(symbol=symbol)
+            log.info(f"[{symbol}] Bulk cancelled standard open orders")
+        except Exception as e:
+            log.debug(f"[{symbol}] Bulk cancel standard orders notice: {e}")
+
+    cancel_all_open_orders = cancel_all_algo_orders
