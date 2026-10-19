@@ -53,7 +53,7 @@ class BotConfig:
 
     # Capital Allocation
     min_wallet_balance: float = 5.0      # Minimum USDT required to trade
-    wallet_risk_fraction: float = 0.9    # Fraction of available balance to use for margin
+    wallet_risk_fraction: float = 0.95   # Fraction of available balance to use for margin (95% of wallet)
 
     # Resilience & Watchdog
     watchdog_timeout_sec: int = 90       # Reconnect WS if no data received in 90 seconds

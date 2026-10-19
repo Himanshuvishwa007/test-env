@@ -144,7 +144,7 @@ class TestProBotModules(unittest.TestCase):
             step_size=0.001,
             min_notional=5.0
         )
-        self.assertEqual(qty, 0.135)
+        self.assertEqual(qty, 0.142)
 
     def test_exchange_signing_and_rounding(self):
         from modules.exchange import BinanceExchange
