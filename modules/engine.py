@@ -9,6 +9,7 @@ import json
 import logging
 import threading
 from typing import Optional
+from urllib.parse import urlparse
 
 import websocket as ws_client
 from binance.client import Client
@@ -272,18 +273,24 @@ class ProBot:
 
         while not self.stop_event.is_set():
             self._ws = None
+            wst = None
+            ws_closed_event = threading.Event()
+
             try:
                 def _on_message(_ws, message):
                     self.on_ws_message(message)
 
                 def _on_error(_ws, error):
                     log.error(f"[{self.symbol}] WS error: {error}")
+                    ws_closed_event.set()
 
                 def _on_open(_ws):
                     log.info(f"[{self.symbol}] WebSocket connected ({stream_name})")
+                    self.last_candle_time = time.time()
 
                 def _on_close(_ws, status_code, msg):
                     log.info(f"[{self.symbol}] WebSocket closed (Code: {status_code}, Msg: {msg})")
+                    ws_closed_event.set()
 
                 self._ws = ws_client.WebSocketApp(
                     ws_url,
@@ -293,8 +300,21 @@ class ProBot:
                     on_close=_on_close,
                 )
 
+                # Configure keepalive ping/pong and optional proxy
+                run_kwargs = {
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                }
+                if self.config.proxy:
+                    parsed = urlparse(self.config.proxy)
+                    if parsed.hostname:
+                        run_kwargs["http_proxy_host"] = parsed.hostname
+                        run_kwargs["http_proxy_port"] = parsed.port or 8080
+                        if parsed.username:
+                            run_kwargs["http_proxy_auth"] = (parsed.username, parsed.password or "")
+
                 wst = threading.Thread(
-                    target=self._ws.run_forever,
+                    target=lambda: self._ws.run_forever(**run_kwargs),
                     name=f"ws-{self.symbol}",
                     daemon=True
                 )
@@ -302,15 +322,15 @@ class ProBot:
                 self.last_candle_time = time.time()
 
                 while not self.stop_event.is_set():
-                    time.sleep(10)
+                    time.sleep(2)
+                    if ws_closed_event.is_set() or not wst.is_alive():
+                        log.info(f"[{self.symbol}] WebSocket disconnected — reconnecting immediately...")
+                        break
                     elapsed = time.time() - self.last_candle_time
                     if elapsed > self.config.watchdog_timeout_sec:
                         log.warning(
-                            f"[{self.symbol}] No candle received in {int(elapsed / 60)} minutes — reconnecting..."
+                            f"[{self.symbol}] Watchdog: No candle data received in {int(elapsed)}s — reconnecting..."
                         )
-                        break
-                    if not wst.is_alive():
-                        log.warning(f"[{self.symbol}] WebSocket thread died — reconnecting...")
                         break
 
             except Exception as e:
@@ -322,10 +342,12 @@ class ProBot:
                         self._ws.close()
                     except Exception:
                         pass
+                if wst and wst.is_alive():
+                    wst.join(timeout=2.0)
 
             if not self.stop_event.is_set():
-                log.info(f"[{self.symbol}] Reconnecting WebSocket in 5 seconds...")
-                self.stop_event.wait(5.0)
+                log.info(f"[{self.symbol}] Reconnecting WebSocket in 3 seconds...")
+                self.stop_event.wait(3.0)
 
         log.info(f"[{self.symbol}] Bot run loop terminated")
 

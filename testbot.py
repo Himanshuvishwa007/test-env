@@ -11,6 +11,7 @@ import signal
 import logging
 import argparse
 import threading
+from urllib.parse import urlparse
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
@@ -494,6 +495,19 @@ def run_live_stream(
             def _on_open(_ws):
                 log.info(f"[{symbol_name}] WebSocket stream connected to {stream_url}")
 
+            # Configure keepalive ping/pong and optional proxy
+            run_kwargs = {
+                "ping_interval": 20,
+                "ping_timeout": 10,
+            }
+            if config.proxy:
+                parsed = urlparse(config.proxy)
+                if parsed.hostname:
+                    run_kwargs["http_proxy_host"] = parsed.hostname
+                    run_kwargs["http_proxy_port"] = parsed.port or 8080
+                    if parsed.username:
+                        run_kwargs["http_proxy_auth"] = (parsed.username, parsed.password or "")
+
             while not shutdown_flag.is_set():
                 ws = ws_client.WebSocketApp(
                     stream_url,
@@ -501,7 +515,7 @@ def run_live_stream(
                     on_error=_on_error,
                     on_open=_on_open
                 )
-                ws.run_forever()
+                ws.run_forever(**run_kwargs)
                 if not shutdown_flag.is_set():
                     time.sleep(3)
 

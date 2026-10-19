@@ -56,7 +56,7 @@ class BotConfig:
     wallet_risk_fraction: float = 0.9    # Fraction of available balance to use for margin
 
     # Resilience & Watchdog
-    watchdog_timeout_sec: int = 15 * 60  # Reconnect WS if no candle in 15 minutes
+    watchdog_timeout_sec: int = 90       # Reconnect WS if no data received in 90 seconds
     position_poll_interval: float = 3.0  # Seconds between background position checks
 
     # Binance API & Endpoints
