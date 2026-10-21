@@ -34,8 +34,10 @@ class BotConfig:
 
     # Momentum Confirmation Filter (RSI)
     rsi_period: int = 14
-    rsi_min: float = 50.0          # RSI must be >= 50 for Long breakout
-    rsi_max: float = 50.0          # RSI must be <= 50 for Short breakout
+    rsi_min: float = 50.0          # Minimum RSI for Long breakout
+    rsi_max_long: float = 68.0     # Maximum RSI for Long breakout (avoids buying at overextended peaks)
+    rsi_max: float = 50.0          # Maximum RSI for Short breakout
+    rsi_min_short: float = 32.0    # Minimum RSI for Short breakout (avoids selling at oversold bottoms)
     rsi_oversold: float = 50.0     # Backward compatibility alias
     rsi_overbought: float = 50.0   # Backward compatibility alias
 
@@ -47,13 +49,13 @@ class BotConfig:
     wick_ratio: float = 0.25       # Minimum wick ratio if used
 
     # Risk Management & Stop Loss
-    sl_pct: float = 0.010          # 1.0% tight, risk-managed stop loss
-    tp_pct_min: float = 0.018      # 1.8% profit target (1.8:1 Risk:Reward ratio)
+    sl_pct: float = 0.009          # 0.9% risk-managed stop loss (2.7% loss on 3x margin)
+    tp_pct_min: float = 0.012      # 1.2% profit target (3.6% ROI on 3x margin)
     cooldown_candles: int = 1      # 1 candle wait after trade exit
 
     # Capital Allocation
     min_wallet_balance: float = 5.0      # Minimum USDT required to trade
-    wallet_risk_fraction: float = 0.95   # Fraction of available balance to use for margin (95% of wallet)
+    wallet_risk_fraction: float = 1   # Fraction of available balance to use for margin (100% of wallet)
 
     # Resilience & Watchdog
     watchdog_timeout_sec: int = 90       # Reconnect WS if no data received in 90 seconds

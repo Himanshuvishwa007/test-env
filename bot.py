@@ -62,11 +62,24 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="Data feed: 'auto' (WS with REST fallback), 'ws' (WebSocket), or 'rest' (pure REST polling)"
     )
+    parser.add_argument(
+        "--tp",
+        type=float,
+        default=None,
+        help="Take profit percentage target (e.g. 0.012 or 1.2 for 1.2%%)"
+    )
+    parser.add_argument(
+        "--sl",
+        type=float,
+        default=None,
+        help="Stop loss percentage threshold (e.g. 0.009 or 0.9 for 0.9%%)"
+    )
     return parser.parse_args()
 
 
 def display_banner(config: BotConfig, active_symbols: List[str]) -> None:
     """Prints startup summary and operational parameters."""
+    rr_str = f"{config.tp_pct_min / config.sl_pct:.1f}:1 R:R" if config.sl_pct else "NA"
     log.info("=" * 65)
     log.info("           ProBot Binance Futures Automated Trader            ")
     log.info("=" * 65)
@@ -77,8 +90,8 @@ def display_banner(config: BotConfig, active_symbols: List[str]) -> None:
     log.info(f" Leverage        : {config.leverage}x")
     log.info(f" Strategy        : VWAP Volatility Momentum Breakout")
     log.info(f" VWAP Bands      : {config.vwap_band_mult}x Standard Deviations (288-period)")
-    log.info(f" Momentum Filter : RSI >= 50 (Long), RSI <= 50 (Short)")
-    log.info(f" Risk Management : SL={config.sl_pct*100:.1f}% | TP={config.tp_pct_min*100:.1f}% (1.8:1 R:R)")
+    log.info(f" Momentum Filter : RSI in [{config.rsi_min:.0f}-{config.rsi_max_long:.0f}] (Long), [{config.rsi_min_short:.0f}-{config.rsi_max:.0f}] (Short)")
+    log.info(f" Risk Management : SL={config.sl_pct*100:.1f}% | TP={config.tp_pct_min*100:.1f}% ({rr_str})")
     log.info("=" * 65)
 
 
@@ -96,6 +109,10 @@ def main() -> None:
         config.leverage = args.leverage
     if args.feed:
         config.data_feed = args.feed
+    if args.tp is not None:
+        config.tp_pct_min = args.tp if args.tp < 1.0 else (args.tp / 100.0)
+    if args.sl is not None:
+        config.sl_pct = args.sl if args.sl < 1.0 else (args.sl / 100.0)
 
     # Validate API credentials
     if not config.api_key or not config.api_secret:

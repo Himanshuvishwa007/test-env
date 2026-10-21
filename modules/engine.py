@@ -313,10 +313,11 @@ class ProBot:
         )
         monitor_thread.start()
 
+        rr_str = f"{self.config.tp_pct_min / self.config.sl_pct:.1f}:1 R:R" if self.config.sl_pct else "NA"
         log.info(
             f"[{self.symbol}] BOT STARTED | Strategy=VWAP Volatility Momentum Breakout | "
             f"Bands={self.config.vwap_band_mult}x Std | SL={self.config.sl_pct*100:.1f}% | "
-            f"TP={self.config.tp_pct_min*100:.1f}% (1.8:1 R:R)"
+            f"TP={self.config.tp_pct_min*100:.1f}% ({rr_str})"
         )
 
         if self.config.data_feed == "rest":

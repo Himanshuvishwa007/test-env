@@ -80,18 +80,21 @@ class VwapBreakoutStrategy:
             return None
 
         rsi_min_thresh = getattr(self.config, "rsi_min", 50.0)
+        rsi_max_long_thresh = getattr(self.config, "rsi_max_long", 68.0)
         rsi_max_thresh = getattr(self.config, "rsi_max", 50.0)
+        rsi_min_short_thresh = getattr(self.config, "rsi_min_short", 32.0)
 
         # ──────────────────────────────────────────────────────────────────────
         # LONG SIGNAL (Bullish Volatility Breakout):
         # 1. Close broke above Upper Statistical Band
         # 2. Bullish candle (close > open)
-        # 3. Momentum confirmed: RSI >= 50 and price above VWAP
+        # 3. Momentum confirmed: 50 <= RSI <= 68 and price above VWAP
         # ──────────────────────────────────────────────────────────────────────
         is_long = (
             close > upper_b and
             close > open_p and
             rsi_val >= rsi_min_thresh and
+            rsi_val <= rsi_max_long_thresh and
             close > vwap_val
         )
 
@@ -99,12 +102,13 @@ class VwapBreakoutStrategy:
         # SHORT SIGNAL (Bearish Volatility Breakdown):
         # 1. Close broke below Lower Statistical Band
         # 2. Bearish candle (close < open)
-        # 3. Momentum confirmed: RSI <= 50 and price below VWAP
+        # 3. Momentum confirmed: 32 <= RSI <= 50 and price below VWAP
         # ──────────────────────────────────────────────────────────────────────
         is_short = (
             close < lower_b and
             close < open_p and
             rsi_val <= rsi_max_thresh and
+            rsi_val >= rsi_min_short_thresh and
             close < vwap_val
         )
 

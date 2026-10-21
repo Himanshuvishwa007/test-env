@@ -123,6 +123,61 @@ class TestProBotModules(unittest.TestCase):
         )
         self.assertIsNone(signal)
 
+    def test_strategy_rsi_exhaustion_protection(self):
+        # Long signal blocked when RSI is above rsi_max_long (68.0)
+        indicators_overbought = IndicatorValues(
+            vwap=2000.0,
+            vwap_std=20.0,
+            upper_band=2030.0,
+            lower_band=1970.0,
+            rsi=72.0,  # Overbought exhaustion
+            adx=20.0,
+            atr=10.0,
+            ema=1990.0
+        )
+        signal = self.strategy.evaluate_signal(
+            close=2035.0,
+            indicators=indicators_overbought,
+            open_price=2025.0,
+            high=2040.0,
+            low=2022.0
+        )
+        self.assertIsNone(signal)
+
+        # Short signal blocked when RSI is below rsi_min_short (32.0)
+        indicators_oversold = IndicatorValues(
+            vwap=2000.0,
+            vwap_std=20.0,
+            upper_band=2030.0,
+            lower_band=1970.0,
+            rsi=25.0,  # Oversold exhaustion
+            adx=20.0,
+            atr=10.0,
+            ema=2010.0
+        )
+        signal = self.strategy.evaluate_signal(
+            close=1965.0,
+            indicators=indicators_oversold,
+            open_price=1975.0,
+            high=1978.0,
+            low=1960.0
+        )
+        self.assertIsNone(signal)
+
+    def test_default_targets_tp_sl(self):
+        default_cfg = BotConfig()
+        strat = MeanReversionStrategy(default_cfg)
+        targets = strat.calculate_targets(
+            side="BUY",
+            entry_price=2000.0,
+            tick_size=0.1
+        )
+        # Entry = 2000.0, TP = +1.2% (2024.0), SL = -0.9% (1982.0)
+        self.assertAlmostEqual(targets.take_profit, 2024.0, places=1)
+        self.assertAlmostEqual(targets.stop_loss, 1982.0, places=1)
+        self.assertEqual(targets.tp_pct, 0.012)
+        self.assertEqual(targets.sl_pct, 0.009)
+
     def test_calculate_targets(self):
         # Long targets with VWAP reversion target
         targets_buy = self.strategy.calculate_targets(
